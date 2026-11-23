@@ -3,8 +3,15 @@ ChatGPT-style Library Assistant Chatbot (student demo project).
 
 How it answers - in this order, always:
   1. Book search / availability  -> SQLite ONLY (database.py). Never invent.
-  2. Library FAQ (hours, membership, borrowing, returning, fines) -> built-in answers.
-  3. General chat -> Groq (free tier) IF a key is set, else rule-based fallback.
+     The 80 books are demonstration data, not verified UOS holdings.
+  2. Official library questions -> verified facts in library_info.py only,
+     each with its official source link.
+  3. Real policy questions (limits, fines, membership, renewal conditions)
+     -> honest "not published in the sources checked" + library contact.
+     Demo sample rules are shown ONLY when the user explicitly asks about
+     the demo project's sample rules, and always start with the DEMO ONLY
+     label (decision D1).
+  4. General chat -> Groq (free tier) IF a key is set, else rule-based fallback.
      Groq is never asked about book titles or availability.
 
 Language: English + Roman Urdu. The reply tries to match the user's language.
@@ -19,25 +26,35 @@ import uuid
 import streamlit as st
 
 from database import count_by_subject, init_db, search_books
+from library_info import DEMO_LABEL, get_fact, policy_not_published
 
-# ---------- Library info (demo / sample - change for your real library) ----------
-LIBRARY_HOURS = "Monday to Friday: 8:30 AM - 8:00 PM | Saturday: 9:00 AM - 5:00 PM | Sunday: Closed"
-MEMBERSHIP_INFO = (
-    "Students can get free library membership with a valid university student card. "
-    "Bring your student card to the circulation desk to register."
+# ---------- DEMO sample policies (student project ONLY - NOT UOS policy) ----------
+# These sample rules exist only so the demo can show how a policy answer
+# looks. They are NEVER shown automatically (decision D1): get_reply()
+# returns them only for an explicit demo-policy question, and every such
+# answer begins with DEMO_LABEL from library_info.py.
+DEMO_MEMBERSHIP_INFO = (
+    "Sample rule: students can get free library membership with a valid "
+    "university student card, registered at the circulation desk."
 )
-BORROW_INFO = (
-    "Students can borrow up to 3 books for 14 days. Bring the book and your student card "
-    "to the circulation desk to borrow it."
+DEMO_BORROW_INFO = (
+    "Sample rule: students can borrow up to 3 books for 14 days, issued at "
+    "the circulation desk with a student card."
 )
-RETURN_INFO = (
-    "Return books at the circulation desk before the due date. "
-    "You can renew a book once for 7 more days if no one else has reserved it."
+DEMO_RETURN_INFO = (
+    "Sample rule: return books at the circulation desk before the due "
+    "date; a book can be renewed once for 7 more days if no one else has "
+    "reserved it."
 )
-FINE_INFO = (
-    "Late return fine (demo rule): Rs. 10 per day, per book. "
-    "Please confirm the current fine at the circulation desk."
-)
+DEMO_FINE_INFO = "Sample rule: late return fine of Rs. 10 per day, per book."
+
+DEMO_POLICY_ANSWERS = {
+    "membership": DEMO_MEMBERSHIP_INFO,
+    "borrow": DEMO_BORROW_INFO,
+    "return": DEMO_RETURN_INFO,
+    "renew": DEMO_RETURN_INFO,
+    "fine": DEMO_FINE_INFO,
+}
 
 # Only genuine Roman Urdu words - English words like "time"/"fine"/"member"
 # must NOT trigger Urdu detection, or English questions get Urdu replies.
@@ -47,29 +64,45 @@ ROMAN_URDU_WORDS = [
     "wapas", "lena", "dena", "kitaab",
 ]
 
-FAQ = [
-    # Fine first: "fine for late return" must not be answered as a return question.
-    (["fine", "late", "jurmana"], "fine"),
-    (["open", "khulti", "timing", "hours", "time"], "hours"),
-    (["member", "membership", "register"], "membership"),
-    (["borrow", "lena", "issue"], "borrow"),
-    (["return", "wapas"], "return"),
+# ---------- Official-info routing (library_info.py facts) ----------
+# Order matters: specific topics before generic ones, and all of these
+# before the book search, so e.g. "How many books are in the library?"
+# reaches the official collections fact instead of the SQLite search.
+OFFICIAL_ROUTES = [
+    (["sunday", "itwaar"], "sunday"),
+    (["break", "lunch", "waqfa"], "break"),
+    (["turnitin", "similarity", "plagiarism"], "turnitin"),
+    (["pakcat", "opac", "catalogue", "catalog"], "catalogue"),
+    (["e-book", "ebook", "ebooks"], "ebooks"),
+    (["hec", "digital library", "online journal"], "hec"),
+    (["how many books", "collection", "total books", "printed books",
+      "books are in the library", "library collection"], "collections"),
+    (["contact", "phone", "email", "address", "helpline", "rabta"], "contact"),
+    (["seminar librar"], "seminar_libraries"),
+    (["history", "archive", "government college"], "history"),
+    (["facilit", "learning zone", "faculty lounge", "research commons",
+      "digital commons", "reference hall", "discussion room", "seating",
+      "study space"], "facilities"),
+    (["wifi", "wi-fi", "internet"], "wifi"),
+    (["photocopy", "printing"], "photocopy"),
+    (["renew", "reserve", "reservation"], "renewal"),
+    (["service", "reference", "orientation", "information literacy",
+      "endnote", "mendeley", "spss", "literature search", "research support",
+      "research help", "document delivery", "inter-library", "inter library",
+      "book searching"], "services"),
+    (["open", "khulti", "timing", "hours", "schedule", "kis time"], "hours"),
 ]
 
-FAQ_EN = {
-    "hours": f"📚 Library hours: {LIBRARY_HOURS}",
-    "membership": f"🪪 Membership: {MEMBERSHIP_INFO}",
-    "borrow": f"📖 Borrowing: {BORROW_INFO}",
-    "return": f"↩️ Returning: {RETURN_INFO}",
-    "fine": f"💰 Fines: {FINE_INFO}",
-}
-FAQ_UR = {
-    "hours": f"📚 Library ki timing: {LIBRARY_HOURS}",
-    "membership": f"🪪 Membership: {MEMBERSHIP_INFO} Student card saath layein.",
-    "borrow": f"📖 Kitab lena: {BORROW_INFO}",
-    "return": f"↩️ Kitab wapas: {RETURN_INFO}",
-    "fine": f"💰 Fine: {FINE_INFO}",
-}
+# Real policy questions whose official answers are NOT published (D1).
+POLICY_ROUTES = [
+    (["fine", "jurmana", "late fee", "penalty"], "fine",
+     "borrowing fines and late-return charges", "fine aur late-return charges ki policy"),
+    (["member", "library card"], "membership",
+     "membership and library-card policy", "membership aur library-card ki policy"),
+    (["how many books can", "borrow limit", "borrowing limit", "loan period",
+      "how long can i keep", "kitni kitabein le"], "borrow",
+     "borrowing limits and loan periods", "borrowing limits aur loan period ki policy"),
+]
 
 
 def is_roman_urdu(text):
@@ -92,7 +125,11 @@ def format_books(books, roman_urdu=False):
     extra = ""
     if len(books) > 5:
         extra = f"\n...and {len(books) - 5} more matching books in the demo data."
-    intro = "Mujhe ye kitabein mili hain:" if roman_urdu else "I found these books in the demo library:"
+    intro = (
+        "Ye kitabein demo catalogue (80 sample books — demonstration data, asal UOS holdings nahi) mein mili hain:"
+        if roman_urdu
+        else "I found these books in the demo catalogue (80 sample books — demonstration data, not verified UOS holdings):"
+    )
     return intro + "\n\n" + "\n\n".join(lines) + extra
 
 
@@ -117,7 +154,7 @@ def ask_groq_or_fallback(user_text, roman_urdu):
                     "role": "system",
                     "content": (
                         "You are UOS Library AI, a helpful library assistant. "
-                        "Do NOT invent book titles or book availability. "
+                        "Do NOT invent book titles, book availability, or library policies, fines or fees. "
                         "For any book search or availability question, say the user "
                         "should search the library database. Answer in the user's language."
                     ),
@@ -144,16 +181,53 @@ SEARCH_STOPWORDS = {
 }
 
 
+def _demo_policy_key(low):
+    """Which demo sample policy (if any) a question is about."""
+    if any(k in low for k in ["fine", "jurmana", "late"]):
+        return "fine"
+    if any(k in low for k in ["member", "card"]):
+        return "membership"
+    if "renew" in low:
+        return "renew"
+    if any(k in low for k in ["return", "wapas"]):
+        return "return"
+    if any(k in low for k in ["borrow", "rule"]):
+        return "borrow"
+    return None
+
+
 def get_reply(user_text):
-    """Main brain: SQLite first, FAQ second, Groq/fallback last."""
+    """Main brain, in order: explicit demo-policy request, official facts,
+    unpublished-policy honesty, SQLite book search, Groq/fallback."""
     text = user_text.strip()
     low = text.lower()
     roman_urdu = is_roman_urdu(text)
 
-    # 1. FAQ - check before a general search, so "library kis time khulti hai" works.
-    for keywords, key in FAQ:
+    # 1. Explicit demo-policy request ONLY (D1): the user must actually
+    # ask about the demo project's sample rules. The answer always
+    # begins with the exact DEMO ONLY label.
+    if "demo" in low or "sample" in low:
+        key = _demo_policy_key(low)
+        if key:
+            return f"{DEMO_LABEL}\n\n{DEMO_POLICY_ANSWERS[key]}"
+
+    # 2. Real policy questions that are NOT officially published (D1):
+    # honest "not published" + library contact. No demo figures, ever.
+    # Checked BEFORE the official routes: "How many books can I borrow?"
+    # is a borrow-limit question, not a collections question.
+    for keywords, _key, topic_en, topic_ur in POLICY_ROUTES:
         if any(k in low for k in keywords):
-            return (FAQ_UR if roman_urdu else FAQ_EN)[key]
+            return policy_not_published(topic_en, topic_ur, roman_urdu)
+
+    # 3. Official verified information (library_info.py), with sources.
+    for keywords, key in OFFICIAL_ROUTES:
+        if any(k in low for k in keywords):
+            return get_fact(key, roman_urdu)
+
+    # 3b. Borrowing / returning process: the official circulation-desk
+    # answer (limits themselves stay unpublished - see step 3).
+    if any(k in low for k in ["borrow", "issue", "lena", "return", "wapas"]):
+        return get_fact("circulation", roman_urdu)
 
     # 2. Book search - any question mentioning a book, author or subject.
     # Try the whole text first, then each word longest-first, so
@@ -170,11 +244,11 @@ def get_reply(user_text):
             return "Maaf kijiye, ye kitab demo data mein nahi mili. Koi aur title, author ya subject try karein."
         return "Sorry, I could not find that book in the demo data. Please try another title, author or subject."
 
-    # 3. Greetings / general chat
+    # 4. Greetings / general chat
     if low in ("hi", "hello", "salam", "assalam o alaikum", "aoa"):
         if roman_urdu:
-            return "Wa Alaikum Assalam! Main UOS Library AI hoon. Aap kitab search kar sakte hain, ya library timing, membership aur fine ke baare mein pooch sakte hain."
-        return "Hello! I am UOS Library AI. You can search for a book, or ask about library hours, membership, borrowing and fines."
+            return "Wa Alaikum Assalam! Main UOS Library AI hoon. Aap demo catalogue mein kitab search kar sakte hain, ya official library timing, services, Turnitin aur contact ke baare mein pooch sakte hain."
+        return "Hello! I am UOS Library AI. You can search the demo book catalogue, or ask about official library hours, services, Turnitin and contact details."
 
     ai_reply = ask_groq_or_fallback(text, roman_urdu)
     if ai_reply:
@@ -182,12 +256,12 @@ def get_reply(user_text):
 
     if roman_urdu:
         return (
-            "Main aapki madad kar sakta hoon: kitab search karein (title, author ya subject se), "
-            "ya poochein - library timing, membership, borrowing, return ya fine."
+            "Main aapki madad kar sakta hoon: demo catalogue mein kitab search karein (title, author ya subject se), "
+            "ya poochein - library timing, services, Turnitin, e-books, HEC Digital Library ya contact."
         )
     return (
-        "I can help you search for books (by title, author or subject), "
-        "or answer about library hours, membership, borrowing, returning and fines. "
+        "I can help you search the demo book catalogue (by title, author or subject), "
+        "or answer about official library hours, services, Turnitin, e-books, the HEC Digital Library and contact details. "
         "Try e.g. 'Find Python books' or 'What time does the library open?'"
     )
 
@@ -200,7 +274,7 @@ def get_reply(user_text):
 # show one visitor's chats to every other visitor.
 GREETING = {
     "role": "assistant",
-    "content": "Hello! 👋 I am **UOS Library AI**. Ask me to find a book, check if it is available, or tell you the library hours. Try: *Find Python books*",
+    "content": "Hello! 👋 I am **UOS Library AI**. Ask me to find a book in the demo catalogue, or ask about official library hours, services, Turnitin and contact details. Try: *Find Python books*",
 }
 
 
@@ -294,7 +368,7 @@ st.caption("Your Smart Library Assistant  •  Demonstration data only")
 
 with st.sidebar:
     st.header("UOS Library AI")
-    st.write("Ask about books, hours, membership, borrowing, returns and fines — in English or Roman Urdu.")
+    st.write("Search the demo book catalogue, or ask about official library hours, services, Turnitin and contacts — in English or Roman Urdu.")
     if st.button("➕ New Chat", use_container_width=True):
         # The old chat stays saved in st.session_state.chats - it is
         # NOT deleted. A fresh chat simply becomes the current one.
@@ -318,22 +392,34 @@ with st.sidebar:
         "What time does the library open?",
         "Library kis time khulti hai?",
         "Mujhe Python ki kitab chahiye",
+        "How do I get a Turnitin check?",
+        "Show me the online catalogue",
         "What is the fine for late return?",
     ]:
         if st.button(example, use_container_width=True):
             st.session_state.pending_prompt = example
     st.divider()
+    st.subheader("Official links")
+    st.markdown(
+        "- [Wazir Agha Library](https://library.su.edu.pk/)\n"
+        "- [PakCat catalogue — UOS](https://pakcat.pastic.gov.pk/library/45/university-of-sargodha)\n"
+        "- [UOS E-Books](https://ebooks.su.edu.pk/)\n"
+        "- [HEC Digital Library — UOS](https://www.digitallibrary.edu.pk/sargodhauni.html)"
+    )
+    st.divider()
     st.caption(
-        "Demo project: not officially endorsed by the University of Sargodha "
-        "and does not access real university library records. "
-        "All book data is sample data. Book availability comes from SQLite only."
+        "Student demo project: not officially endorsed by the University of "
+        "Sargodha. Library information shown here comes from the university's "
+        "public pages, with sources. The book catalogue is 80 demonstration "
+        "books only and does not access real university library records. "
+        "Book availability comes from SQLite only."
     )
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-prompt = st.chat_input("Ask about a book, library hours, membership, fines...")
+prompt = st.chat_input("Ask about a book, library hours, services, Turnitin...")
 if "pending_prompt" in st.session_state:
     prompt = st.session_state.pop("pending_prompt")
 
