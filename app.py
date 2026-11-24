@@ -30,9 +30,12 @@ How it answers - in this order, always:
      Groq is never asked about book titles or availability.
 
 Language: English + Roman Urdu. The reply tries to match the user's language.
-Chat history: multiple separate chats in the sidebar (session-only -
-kept while the browser session is active, not saved after it closes).
-No student login system. All book data is demonstration data.
+Chat history: multiple separate chats in the sidebar. Guests are
+session-only (nothing is saved). Students who register/sign in
+(Stage 4, Supabase, see supabase_store.py + supabase_schema.sql)
+get their chats saved permanently and privately under Row Level
+Security; guest mode works with no configuration at all.
+All book data is demonstration data.
 """
 
 import difflib
@@ -43,11 +46,16 @@ import uuid
 import streamlit as st
 
 from database import count_by_subject, init_db, search_books
-from library_faq import faq_answer
-from library_info import DEMO_LABEL, get_fact, policy_not_published
-from library_academic_faq import academic_faq_answer
-from library_digital_faq import digital_faq_answer
-from library_services_faq import service_faq_answer
+from library_faq import FAQS as RULES_FAQS, _content_words, faq_answer
+from library_info import DEMO_LABEL, FACTS, get_fact, policy_not_published
+
+try:
+    import supabase_store as store
+except Exception:  # accounts are optional - guest mode must never break
+    store = None
+from library_academic_faq import FAQS as ACADEMIC_FAQS, academic_faq_answer
+from library_digital_faq import FAQS as DIGITAL_FAQS, digital_faq_answer
+from library_services_faq import FAQS as SERVICES_FAQS, service_faq_answer
 
 # ---------- DEMO sample policies (student project ONLY - NOT UOS policy) ----------
 # These sample rules exist only so the demo can show how a policy answer
@@ -94,34 +102,41 @@ OFFICIAL_ROUTES = [
     (["break", "lunch", "waqfa"], "break"),
     (["turnitin", "similarity", "plagiarism"], "turnitin"),
     (["pakcat", "opac", "catalogue", "catalog"], "catalogue"),
-    (["e-book", "ebook", "ebooks"], "ebooks"),
+    (["e-book", "ebook", "ebooks", "portal"], "ebooks"),
     (["hec", "digital library", "online journal"], "hec"),
     (["how many books", "collection", "total books", "printed books",
       "books are in the library", "library collection"], "collections"),
-    (["contact", "phone", "email", "address", "helpline", "rabta"], "contact"),
+    (["contact", "phone", "email", "address", "helpline", "rabta", "number"], "contact"),
     (["seminar librar"], "seminar_libraries"),
-    (["history", "archive", "government college"], "history"),
+    (["history", "archive", "government college", "purani",
+      "old book", "rare book"], "history"),
+    (["photocopy", "printing"], "photocopy"),
     (["facilit", "learning zone", "faculty lounge", "research commons",
       "digital commons", "reference hall", "discussion room", "seating",
       "study space"], "facilities"),
     (["wifi", "wi-fi", "internet"], "wifi"),
-    (["photocopy", "printing"], "photocopy"),
     (["renew", "reserve", "reservation"], "renewal"),
     (["service", "reference", "orientation", "information literacy",
       "endnote", "mendeley", "spss", "literature search", "research support",
       "research help", "document delivery", "inter-library", "inter library",
       "book searching"], "services"),
-    (["open", "khulti", "timing", "hours", "schedule", "kis time"], "hours"),
+    (["open", "khulti", "khuli", "khula", "timing", "hours", "schedule",
+      "kis time", "band", "close", "closing"], "hours"),
 ]
 
 # Real policy questions whose official answers are NOT published (D1).
 POLICY_ROUTES = [
-    (["fine", "jurmana", "late fee", "penalty"], "fine",
+    (["fine", "jurmana", "late fee", "penalty", "late return",
+      "overdue book", "overdue books"], "fine",
      "borrowing fines and late-return charges", "fine aur late-return charges ki policy"),
     (["member", "library card"], "membership",
      "membership and library-card policy", "membership aur library-card ki policy"),
     (["how many books can", "borrow limit", "borrowing limit", "loan period",
-      "how long can i keep", "kitni kitabein le"], "borrow",
+      "how long can i keep", "kitni kitabein le", "kitni books issue",
+      "kitni kitabein issue", "kitni books le", "books issue ho sakt",
+      "kitabein issue ho sakt", "issue ho sakt", "kitni books borrow",
+      "how many books can i borrow", "how many books can i issue",
+      "kitne din ke liye", "book mil sakt", "book rakh sakt"], "borrow",
      "borrowing limits and loan periods", "borrowing limits aur loan period ki policy"),
 ]
 
@@ -349,39 +364,338 @@ def _not_found_reply(text, low, roman_urdu):
     return f"{base} {tail}"
 
 
-def ask_groq_or_fallback(user_text, roman_urdu):
-    """General chat only. Returns None if no Groq key - caller uses fallback."""
-    api_key = None
+# ---------- Stage 2: Groq AI brain (grounded, fallback-safe) ----------
+# The deterministic layers (FAQs, official facts, policy honesty,
+# SQLite book search) answer FIRST and never call the API. Groq is
+# used only for what they cannot answer: natural conversation,
+# follow-ups, explanations and open questions. It receives retrieved
+# verified knowledge (top FAQ matches + official facts) as grounding
+# and a system prompt that forbids inventing UOS facts. Any failure
+# (no key, timeout, rate limit, bad key) returns None and the caller
+# falls back to the Stage 1 clarification - the app fully works
+# without a key.
+#
+# Models (verified 2026-11-24 against Groq's docs/changelog):
+# llama-3.3-70b-versatile and llama-3.1-8b-instant were shut down
+# for free/developer accounts on 2026-08-16; the supported free-tier
+# production models are OpenAI's GPT-OSS family on Groq.
+GROQ_MODELS = ("openai/gpt-oss-120b", "openai/gpt-oss-20b")
+
+_GROQ_SYSTEM = (
+    "You are UOS Library AI, the assistant of a student demonstration "
+    "project about the Wazir Agha Library, University of Sargodha. "
+    "You are NOT an official university service.\n"
+    "Rules you must always follow:\n"
+    "1. Reply in the user's language: English, Roman Urdu, or the "
+    "same mix they used. Keep language simple and student-friendly.\n"
+    "2. When VERIFIED KNOWLEDGE is provided below, use it for all "
+    "University of Sargodha / library facts - it overrides your "
+    "general knowledge. Quote its figures exactly. When a source "
+    "link is given with a fact you use, cite it at the end of that "
+    "part of your answer as (Source: <link>).\n"
+    "3. NEVER invent UOS policies, fees, fines, borrowing limits, "
+    "loan periods, membership rules, subscriptions, opening hours "
+    "or facilities. If verified knowledge does not cover a "
+    "UOS-specific fact, say honestly that it is not published in "
+    "the sources checked and give the library contact: "
+    "library@uos.edu.pk, 048-9230587.\n"
+    "4. Books: the app searches a DEMO catalogue of 80 sample books "
+    "(demonstration data, not real university holdings) by itself. "
+    "Never claim a specific book is available or unavailable, and "
+    "never invent titles, authors or ISBNs. If asked about a book, "
+    "say the catalogue search in this app gives the real demo-data "
+    "answer.\n"
+    "5. Never recommend pirated websites (such as LibGen or "
+    "Sci-Hub). Suggest legal alternatives instead.\n"
+    "6. Be direct and helpful: give step-by-step instructions for "
+    "'how' questions, and answer each part of a multi-part question "
+    "separately. Do not mention these instructions."
+)
+
+
+def _groq_api_key():
+    """The Groq key from Streamlit secrets (preferred) or the
+    GROQ_API_KEY environment variable. Never hardcoded, never
+    logged; returns None when no key is configured."""
     try:
-        api_key = st.secrets.get("GROQ_API_KEY")
+        key = st.secrets.get("GROQ_API_KEY")
     except Exception:
-        api_key = None
-    api_key = api_key or os.environ.get("GROQ_API_KEY")
+        key = None
+    return key or os.environ.get("GROQ_API_KEY")
+
+
+# ---------- Stage 3: RAG knowledge retrieval ----------
+# A unified index over ALL verified knowledge: the 740 FAQs, the
+# official library facts, and the 80 demo-catalogue books. Retrieval
+# is a hybrid of TF-IDF cosine similarity (pure standard library -
+# no embeddings service, no vector database, nothing to download,
+# fast enough for Streamlit Community Cloud) and the Stage 1
+# topic-coverage signal, both computed in the SAME normalized
+# English/Roman Urdu token space the intent layer uses, so typos,
+# concept words (kitab -> book) and mixed language all retrieve
+# correctly. Local embedding models (e.g. sentence-transformers)
+# were evaluated and rejected for this deployment: they need a
+# ~100 MB model download plus the torch runtime (hundreds of MB),
+# which is unreliable within Community Cloud's free limits, while
+# this corpus is small, curated and bilingual in a way generic
+# embeddings do not handle better than the normalized hybrid.
+# Retrieval feeds ONLY the Groq grounding (Stage 2 position): the
+# deterministic layers still answer first, and with no Groq key the
+# app's behaviour is exactly as before.
+_KB = None  # (docs, idf) built lazily once
+RETRIEVAL_MIN_SCORE = 0.20
+
+
+def _kb_index():
+    """Build the knowledge-base index once: documents with their
+    weighted TF-IDF vectors. Question text weighs most, answers
+    less; fact documents also carry their Stage 1 signal words as
+    alias tokens ('timing' finds the hours fact)."""
+    global _KB
+    if _KB is not None:
+        return _KB
+    import math
+    from collections import Counter
+
+    docs = []
+
+    def add(doc, weighted_tokens, match_words):
+        vec = Counter()
+        for tok, w in weighted_tokens:
+            vec[tok] += w
+        docs.append({**doc, "_vec": vec, "_match": set(match_words)})
+
+    for faqs, label in ((RULES_FAQS, "Library Rules"),
+                        (SERVICES_FAQS, "Library Services"),
+                        (ACADEMIC_FAQS, "Academic & Research"),
+                        (DIGITAL_FAQS, "Digital Library")):
+        for f in faqs:
+            q_words = (_topic_word_list(f["q_en"])
+                       + _topic_word_list(f["q_ru"]))
+            a_words = (_topic_word_list(f["a_en"])
+                       + _topic_word_list(f["a_ru"]))
+            weighted = ([(t, 2.0) for t in q_words]
+                        + [(t, 1.0) for t in
+                           _topic_word_list(f["category"])]
+                        + [(t, 0.5) for t in a_words])
+            add({"id": f["id"], "kind": "faq", "module": label,
+                 "q_en": f["q_en"], "q_ru": f["q_ru"],
+                 "a_en": f["a_en"], "a_ru": f["a_ru"],
+                 "source": f.get("source", ""),
+                 "status": f.get("status", "")},
+                weighted, q_words)
+    for key, fact in FACTS.items():
+        words = (_topic_word_list(fact["en"])
+                 + _topic_word_list(fact["ur"]))
+        aliases = list(_FACT_SIGNALS.get(key, ()))
+        add({"id": f"FACT-{key}", "kind": "fact",
+             "module": "Official Library Information", "key": key,
+             "source": fact.get("source", "")},
+            [(t, 1.0) for t in words] + [(t, 2.0) for t in aliases],
+            words + aliases)
+    for subject in count_by_subject():
+        for b in search_books(subject, search_by="subject"):
+            words = (_topic_word_list(b["title"])
+                     + _topic_word_list(b["author"])
+                     + _topic_word_list(b["subject"]))
+            weighted = ([(t, 2.0) for t in _topic_word_list(b["title"])]
+                        + [(t, 1.5) for t in _topic_word_list(b["author"])]
+                        + [(t, 1.5) for t in _topic_word_list(b["subject"])])
+            add({"id": f"BOOK-{b['isbn']}", "kind": "book",
+                 "module": "Demo Catalogue (demonstration data)",
+                 "title": b["title"], "author": b["author"],
+                 "subject": b["subject"], "publisher": b["publisher"],
+                 "year": b["year"]},
+                weighted, words)
+    df = Counter()
+    for d in docs:
+        for tok in d["_vec"]:
+            df[tok] += 1
+    n = len(docs)
+    idf = {t: math.log((1 + n) / (1 + c)) + 1.0 for t, c in df.items()}
+    for d in docs:
+        vec = {t: w * idf[t] for t, w in d["_vec"].items()}
+        norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
+        d["_vec"] = {t: v / norm for t, v in vec.items()}
+    _KB = (docs, idf)
+    return _KB
+
+
+def _retrieve_knowledge(user_text, limit=5):
+    """Hybrid retrieval over the knowledge base. Score = TF-IDF
+    cosine (semantic-ish similarity in normalized token space)
+    combined with Stage 1 topic coverage, plus a bonus when a
+    specific named entity (Zotero, Coursera, Turnitin...) matches.
+    Returns [(score, doc)] above the confidence threshold, best
+    first, at most 3 documents per module so multi-part questions
+    can draw on several sources. Empty list when the evidence is
+    too weak - the caller then asks for clarification instead of
+    grounding an answer on irrelevant material."""
+    import math
+    from collections import Counter
+
+    user_words = _topic_words(user_text)
+    # 'library' names the whole domain, not a topic: on its own it
+    # matches hundreds of documents and grounds nothing. Drop it
+    # when real topic words remain (the Stage 1 gate does the same).
+    if len(user_words) > 1:
+        user_words.discard("library")
+        user_words.discard("librarie")  # stemmed form of 'libraries'
+    if not user_words or user_words <= {"library", "librarie"}:
+        return []
+    docs, idf = _kb_index()
+    qcount = Counter(_topic_word_list(user_text))
+    if len(_topic_words(user_text)) > 1:
+        qcount.pop("library", None)
+        qcount.pop("librarie", None)
+    if "thesis" in user_words:
+        # Same expansion as the Stage 1 assisted matcher: theses
+        # live under 'thesis and dissertation' documents.
+        qcount["dissertation"] += 1
+    qvec = {t: c * idf.get(t, 1.0) for t, c in qcount.items()}
+    qnorm = math.sqrt(sum(v * v for v in qvec.values())) or 1.0
+    qvec = {t: v / qnorm for t, v in qvec.items()}
+    entities = user_words & _SPECIFIC_ENTITIES
+    match_words = set(user_words)
+    if "thesis" in match_words:
+        match_words.add("dissertation")
+    scored = []
+    for d in docs:
+        cos = sum(w * d["_vec"].get(t, 0.0) for t, w in qvec.items())
+        if cos <= 0:
+            continue
+        coverage = min(1.0, len(match_words & d["_match"])
+                       / len(user_words))
+        score = 0.6 * cos + 0.4 * coverage
+        if entities and entities & d["_match"]:
+            score += 0.08
+        if score >= RETRIEVAL_MIN_SCORE:
+            scored.append((score, d))
+    scored.sort(key=lambda s: -s[0])
+    picked, per_module = [], Counter()
+    for score, d in scored:
+        if per_module[d["module"]] >= 3:
+            continue
+        per_module[d["module"]] += 1
+        picked.append((score, d))
+        if len(picked) == limit:
+            break
+    return picked
+
+
+def _grounding_context(user_text, roman_urdu):
+    """Stage 3 grounding for the Groq prompt: the top retrieved
+    verified sources (FAQs, official facts, demo books) with their
+    source links, plus the demo-catalogue summary. Retrieved text
+    is labelled by module and status so the model - and the
+    student reading a citation - can tell verified UOS information
+    from general guidance and demo data."""
+    blocks = []
+    try:
+        hits = _retrieve_knowledge(user_text)
+        lines = []
+        for _score, d in hits:
+            if d["kind"] == "faq":
+                q = d["q_ru"] if roman_urdu else d["q_en"]
+                a = d["a_ru"] if roman_urdu else d["a_en"]
+                lines.append(
+                    f"[{d['id']} · {d['module']} · {d['status']}]\n"
+                    f"Q: {q}\nA: {a[:700]}\nSource: {d['source']}")
+            elif d["kind"] == "fact":
+                lines.append(
+                    f"[{d['id']} · Official Library Information]\n"
+                    + get_fact(d["key"], roman_urdu)[:700])
+            else:  # demo book - never state availability here
+                lines.append(
+                    f"[{d['id']} · Demo Catalogue - DEMONSTRATION "
+                    f"DATA, not real university holdings]\n"
+                    f"\"{d['title']}\" by {d['author']} - "
+                    f"{d['subject']}, {d['publisher']} ({d['year']}). "
+                    f"Availability is checked only by the app's own "
+                    f"catalogue search.")
+        if lines:
+            blocks.append("Retrieved verified sources:\n"
+                          + "\n\n".join(lines))
+    except Exception:
+        pass
+    # Official facts the question touches directly (Stage 2 path,
+    # kept as a booster alongside retrieval).
+    try:
+        tokens = set(_normalize_query(user_text).split())
+        facts = [get_fact(k, roman_urdu)
+                 for k, sig in _FACT_SIGNALS.items() if sig & tokens]
+        if facts:
+            blocks.append("Official library facts:\n"
+                          + "\n\n".join(f[:500] for f in facts[:2]))
+    except Exception:
+        pass
+    # Demo catalogue summary (real counts from SQLite).
+    try:
+        counts = count_by_subject()
+        summary = ", ".join(f"{s}: {n}" for s, n in counts.items())
+        blocks.append(
+            f"Demo catalogue: 80 sample books (demonstration data) "
+            f"in these subjects - {summary}. Availability is checked "
+            f"only by the app's own catalogue search.")
+    except Exception:
+        pass
+    return "\n\n".join(blocks)
+
+
+def ask_groq_or_fallback(user_text, roman_urdu, history=None):
+    """Grounded Groq conversation for questions the deterministic
+    layers could not answer. Returns None on ANY problem (no key,
+    SDK missing, timeout, rate limit, invalid key, empty reply) -
+    the caller then uses the Stage 1 clarification fallback."""
+    api_key = _groq_api_key()
     if not api_key:
         return None
     try:
         from groq import Groq
-
-        client = Groq(api_key=api_key)
-        reply = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are UOS Library AI, a helpful library assistant. "
-                        "Do NOT invent book titles, book availability, or library policies, fines or fees. "
-                        "For any book search or availability question, say the user "
-                        "should search the library database. Answer in the user's language."
-                    ),
-                },
-                {"role": "user", "content": user_text},
-            ],
-            max_tokens=300,
-        )
-        return reply.choices[0].message.content
     except Exception:
         return None
+    messages = [{"role": "system", "content": _GROQ_SYSTEM}]
+    grounding = _grounding_context(user_text, roman_urdu)
+    if grounding:
+        messages.append({
+            "role": "system",
+            "content": "VERIFIED KNOWLEDGE (use this for library "
+                       "facts):\n" + grounding,
+        })
+    # Conversation context for follow-ups: the last few turns of
+    # THIS chat only, oldest first, current question excluded (it
+    # is appended separately below).
+    if history:
+        turns = []
+        for msg in history:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            content = str(msg.get("content", "")).strip()
+            if role in ("user", "assistant") and content:
+                turns.append({"role": role,
+                              "content": content[:1200]})
+        messages.extend(turns[-8:])
+    messages.append({"role": "user", "content": user_text})
+    try:
+        client = Groq(api_key=api_key, timeout=30.0, max_retries=1)
+    except Exception:
+        return None
+    for model in GROQ_MODELS:
+        try:
+            reply = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.3,
+                max_completion_tokens=900,
+                reasoning_effort="low",
+            )
+            content = reply.choices[0].message.content
+            if content and content.strip():
+                return content.strip()
+        except Exception:
+            continue  # rate limit / error on this model -> try next
+    return None
 
 
 # Generic words that must NOT be used as a book search term on their own.
@@ -393,7 +707,7 @@ SEARCH_STOPWORDS = {
     "availability", "author", "subject", "does", "not", "exist", "exists",
     "that", "this", "want", "need", "please", "show", "give", "me", "a",
     "an", "the", "on", "about", "mujhe", "chahiye", "karo", "batao",
-    "hai", "hain", "ki", "ka", "ko",
+    "hai", "hain", "ki", "ka", "ko", "library",
 }
 
 
@@ -412,9 +726,551 @@ def _demo_policy_key(low):
     return None
 
 
-def get_reply(user_text):
-    """Main brain, in order: explicit demo-policy request, official facts,
-    unpublished-policy honesty, SQLite book search, Groq/fallback."""
+# ---------- Intent layer (answer-quality upgrade) ----------
+# The strict FAQ matchers are precise but brittle: a one-letter typo
+# ("servise", "scholer") or a natural paraphrase used to fall through
+# every check and land in the book search, so a services question got
+# "Sorry, I could not find that book...". This layer fixes the routing
+# WITHOUT touching the FAQ modules or the database:
+#   1. spelling normalization for common English/Roman-Urdu typos,
+#   2. greeting/thanks handling before everything else,
+#   3. assisted FAQ matching (content-word coverage + clear margin),
+#   4. multi-topic answers (each part answered separately),
+#   5. a book-search GATE - book results only for book questions,
+#   6. a short clarification reply instead of a generic paragraph.
+
+_SPELLING_VARIANTS = {
+    "servise": "service", "servises": "services", "sarvice": "service",
+    "libary": "library", "libraray": "library", "libray": "library",
+    "liberry": "library", "scholer": "scholar", "scholr": "scholar",
+    "refrence": "reference", "refrences": "reference",
+    "turnitn": "turnitin", "timming": "timing",
+    "timmings": "timings", "emial": "email", "adress": "address",
+    "facilties": "facilities", "facilites": "facilities",
+    "availble": "available", "avalable": "available",
+    "availabe": "available", "memership": "membership",
+    "reserch": "research", "assigment": "assignment",
+    "assignement": "assignment", "litrature": "literature",
+    "refernce": "reference", "plagiarizm": "plagiarism",
+    "turniten": "turnitin", "googel": "google", "digitial": "digital",
+    "onilne": "online", "journel": "journal", "artical": "article",
+    "theis": "thesis", "methodolgy": "methodology",
+    "statistcs": "statistics", "databse": "database",
+    "wifii": "wifi", "internt": "internet", "opning": "opening",
+    "isue": "issue", "bok": "book", "boks": "books",
+    "auther": "author", "subjekt": "subject",
+    # Roman Urdu concept words, normalized so topic matching works
+    # across languages (routing only - never shown to the user).
+    "madad": "help", "likhne": "write", "likhna": "write",
+    "likh": "write", "writing": "write",
+    "kitab": "book", "kitaab": "book", "kitabein": "book",
+    "kitabon": "book",
+    "sahulat": "service", "sahulaten": "services",
+    "sahulatein": "services",
+    "charger": "charge", "charging": "charge", "sona": "sleep",
+    "referencing": "citation",
+    # 'Is X allowed?' is the same routing concept as 'Can I use X?'.
+    "allowed": "use", "permitted": "use",
+}
+
+
+def _normalize_query(text):
+    """Lowercase, punctuation-free text with common spelling mistakes
+    corrected word by word. Used ONLY for routing/matching decisions -
+    never shown to the user and never used as a book-search term."""
+    words = re.findall(r"[a-z0-9\-]+", text.lower())
+    return " ".join(_SPELLING_VARIANTS.get(w, w) for w in words)
+
+
+_GREETING_STARTERS = (
+    "assalam o alaikum", "assalamualaikum", "assalam", "salam", "aoa",
+    "hello", "hi", "hey", "good morning", "good afternoon",
+    "good evening",
+)
+_SMALLTALK_REMAINDERS = {
+    "", "how are you", "how are you doing", "how r you",
+    "kya hal hai", "kaise ho", "kese ho", "kya haal hai", "theek ho",
+    "how do you do",
+}
+_THANKS = {
+    "thank you", "thanks", "thank you so much", "shukriya",
+    "bohat shukriya", "boht shukriya", "jazakallah", "jazak allah",
+    "thanks a lot", "thank you very much", "bohat bohat shukriya",
+}
+
+
+def _greeting_remainder(norm):
+    """If the normalized text starts with a greeting, return the rest
+    of the message ('' for a greeting-only message); otherwise None.
+    A greeting followed by a real question returns that question, so
+    the question - not the greeting - gets answered."""
+    for g in _GREETING_STARTERS:
+        if norm == g:
+            return ""
+        if norm.startswith(g + " "):
+            return norm[len(g):].strip(" ,.!?")
+    return None
+
+
+def _phone_use_question(tokens):
+    """'Can I USE my mobile phone?' is a rules question, not a contact
+    question - the word 'phone' alone must never hijack it."""
+    t = set(tokens)
+    if not ({"phone", "mobile"} & t):
+        return False
+    return bool({"use", "istemal", "allowed", "chala"} & t) or \
+        "kar sakt" in " ".join(tokens)
+
+
+_SERVICES_TOKENS = {"service", "services", "sahulat", "sahulatain",
+                    "khidmat", "khidmaat"}
+_FACILITY_TOKENS = {"facility", "facilities", "sahulat", "sahulatain"}
+_OVERVIEW_TOKENS = {"kon", "kaun", "kn", "kya", "what", "which",
+                    "available", "hain", "hai", "list", "batao", "tell",
+                    "offer", "offers", "provide", "provided"}
+_SPECIFIC_TOPIC_TOKENS = {"wifi", "wi-fi", "internet", "turnitin",
+                          "photocopy", "printing", "discussion",
+                          "room", "rooms", "ebook", "ebooks", "hec",
+                          "book", "books", "kitab", "kitaab"}
+
+
+def _overview_fact_key(tokens):
+    """'Which services / facilities are available?' overview questions
+    (including Urdu words like 'sahulat' that no keyword route knows)
+    -> the matching verified overview fact, or None."""
+    t = set(tokens)
+    if _SPECIFIC_TOPIC_TOKENS & t or not (_OVERVIEW_TOKENS & t):
+        return None
+    if _SERVICES_TOKENS & t:
+        return "services"
+    if _FACILITY_TOKENS & t:
+        return "facilities"
+    return None
+
+
+_FACT_SIGNALS = {
+    "hours": {"open", "khulti", "khula", "band", "close", "closing",
+              "timing", "timings", "hours", "schedule", "waqt", "baje"},
+    "contact": {"contact", "number", "email", "address", "rabta",
+                "helpline", "phone"},
+    "wifi": {"wifi", "wi-fi", "internet"},
+    "turnitin": {"turnitin", "similarity"},
+    "ebooks": {"ebook", "ebooks", "e-book", "e-books"},
+    "hec": {"hec"},
+    "collections": {"collection", "collections", "printed"},
+    "facilities": {"facilities", "facility", "seating"},
+    "services": {"service", "services", "sahulat", "khidmat"},
+}
+
+
+def _multi_fact_reply(norm, roman_urdu):
+    """Two different official topics asked in one message ('Library kab
+    band hoti hai aur number kya hai?') -> answer each part separately
+    instead of answering only one (or neither)."""
+    tokens = norm.split()
+    t = set(tokens)
+    found = [k for k, sig in _FACT_SIGNALS.items() if sig & t]
+    if "contact" in found and _phone_use_question(tokens):
+        found.remove("contact")
+    if len(found) != 2:
+        return None
+    if not any(c in norm for c in (" aur ", " and ", " & ", "?")):
+        return None
+    return "\n\n---\n\n".join(get_fact(k, roman_urdu) for k in found)
+
+
+# Function/auxiliary words (English + Roman Urdu) carry no topic, so
+# they are removed before assisted matching: "Google Scholar kaise use
+# karun?" must be scored on {google, scholar, use} alone, otherwise
+# every Urdu auxiliary word dilutes the match into failure.
+_AUX_WORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "do", "does", "did",
+    "can", "could", "should", "would", "i", "me", "my", "we", "you",
+    "your", "it", "its", "in", "on", "of", "for", "to", "from", "by",
+    "at", "with", "about", "what", "how", "when", "where", "why",
+    "which", "who", "please", "tell", "give", "show",
+    "kya", "hai", "hain", "ka", "ki", "ke", "ko", "mein", "se", "aur",
+    "par", "bhi", "to", "ye", "yeh", "wo", "woh", "aap", "ap", "main",
+    "mera", "meri", "mujhe", "apni", "apna", "apne", "liye",
+    "kaise", "kab", "kahan", "kyun", "kyon", "kar", "karo", "karun",
+    "karna", "karne", "karte", "karti", "karein", "karta",
+    "banaun", "banta", "banti", "hoga", "hogi", "milega", "milegi",
+    "milenge", "dein", "parta", "parti", "padta",
+    "sakte", "sakta", "sakti", "chahiye", "batao",
+    "batain", "hota", "hoti", "hote", "wala", "wali", "wale", "kuch",
+    "koi", "ne", "ho", "hun", "he", "ha", "tha", "thi",
+    "cheez", "kaisa", "kesi", "aisa", "aisi", "waisa", "thing",
+    "something", "anything", "stuff", "everything",
+}
+
+
+_TOPIC_STEMS = {"these": "thesis", "theses": "thesis",
+                "citation": "cite", "citations": "cite",
+                "citing": "cite"}
+_NO_STEM = {"thesis", "analysis", "basis"}
+_RU_MARKERS = {"mein", "hai", "hain", "kya", "sakte", "sakta",
+               "kar", "ka", "ki", "ke", "ko", "se"}
+
+
+def _topic_word_list(text):
+    """Ordered topic words (see _topic_words) - order matters for
+    phrase detection: 'research paper' as a phrase is a stronger
+    signal than the two words separately."""
+    raw = re.findall(r"[a-z0-9\-]+", text.lower())
+    ru_context = bool(set(raw) & _RU_MARKERS)
+    norm_text = _normalize_query(text).replace(
+        "group study", "discussion room")
+    out = []
+    for w in norm_text.split():
+        if w == "so" and ru_context:
+            w = "sleep"
+        if w in _AUX_WORDS or len(w) < 3:
+            continue
+        if len(w) > 3 and w.endswith("s") and not w.endswith("ss") \
+                and w not in _NO_STEM:
+            w = w[:-1]
+        out.append(_TOPIC_STEMS.get(w, w))
+    if "mobile" in out:
+        out = ["phone" if w == "mobile" else w for w in out]
+    return out
+
+
+def _topic_words(text):
+    """The topic-carrying words of a question: spelling-normalized,
+    auxiliary words removed, light plural stemming (phones -> phone)
+    applied consistently to questions and FAQ canonicals alike."""
+    raw = re.findall(r"[a-z0-9\-]+", text.lower())
+    ru_context = bool(set(raw) & _RU_MARKERS)
+    norm_text = _normalize_query(text).replace(
+        "group study", "discussion room")  # one concept, two phrasings
+    out = set()
+    for w in norm_text.split():
+        if w == "so" and ru_context:
+            w = "sleep"  # Roman Urdu 'so sakte hain' = 'can I sleep'
+        if w in _AUX_WORDS or len(w) < 3:
+            continue
+        if len(w) > 3 and w.endswith("s") and not w.endswith("ss") \
+                and w not in _NO_STEM:
+            w = w[:-1]
+        out.add(_TOPIC_STEMS.get(w, w))
+    if "mobile" in out:
+        # 'mobile' and 'phone' are one concept - counting both would
+        # dilute coverage ('mobile silent karna hai?' vs the phone
+        # rule), so keep only 'phone'.
+        out.discard("mobile")
+        out.add("phone")
+    return out
+
+
+_PAIR_BLOCK = {"use", "library", "book", "get", "make", "find",
+               "help", "student", "students", "online", "free",
+               "good", "many", "much", "first"}
+
+# Generic words that must never be answered from a single-word query
+# ('help' alone gets a clarification, not a random FAQ about help).
+_SINGLE_WORD_BLOCK = {
+    "help", "information", "service", "services", "online", "study",
+    "data", "free", "work", "use", "find", "get", "make", "good",
+    "best", "paper", "research", "book", "library", "download",
+    "search", "available", "access", "account", "website", "open",
+    "close", "start", "check", "learn", "learning", "read",
+    "reading", "write", "writing", "guide", "support", "list",
+    "show", "tell", "give", "know", "want", "need", "question",
+    "questions", "detail", "details", "step", "steps", "topic",
+    "topics", "course", "courses", "class", "classes", "student",
+    "students", "user", "users", "people", "time", "long", "many",
+    "much", "difference", "example", "examples", "important",
+    "benefits", "tips", "resources", "resource", "tools", "tool",
+    "materials", "material", "content", "part", "parts", "type",
+    "types", "way", "ways", "meaning", "mean", "means",
+}
+
+# Named products/portals/services. If an FAQ is about one of these and
+# the user never mentioned it, that FAQ is probably about a different
+# thing than the user asked (e.g. 'Can I use the E-BOOKS PORTAL on my
+# mobile phone?' must not answer 'Can I use my phone in the library?').
+_SPECIFIC_ENTITIES = {
+    "portal", "e-book", "e-books", "ebook", "ebooks", "turnitin",
+    "zotero", "mendeley", "endnote", "spss", "smartpls", "nvivo",
+    "maxqda", "scholar", "hec", "ieee", "emerald", "scopus",
+    "sciencedirect", "pubmed", "orcid", "researchgate", "linkedin",
+    "coursera", "edx", "udemy", "kaggle", "tableau", "qgis", "doi",
+    "whatsapp", "facebook", "youtube", "instagram", "gmail",
+    "proquest", "jstor", "springer", "wiley", "taylor", "francis",
+    "libgen", "sci-hub", "google",
+}
+
+_FAQ_INDEX = None
+_WORD_HITS = None
+
+
+def _faq_index():
+    """Every FAQ's canonical-question topic words, per module, plus a
+    count of how many FAQs use each word (for distinctiveness
+    tie-breaks). Built once, lazily."""
+    global _FAQ_INDEX, _WORD_HITS
+    if _FAQ_INDEX is None:
+        _FAQ_INDEX = []
+        _WORD_HITS = {}
+        for rank, (faqs, answer_fn) in enumerate((
+            (RULES_FAQS, faq_answer),
+            (SERVICES_FAQS, service_faq_answer),
+            (ACADEMIC_FAQS, academic_faq_answer),
+            (DIGITAL_FAQS, digital_faq_answer),
+        )):
+            for faq in faqs:
+                words = _topic_words(faq["q_en"]) | \
+                    _topic_words(faq["q_ru"])
+                pairs = set()
+                for q in (faq["q_en"], faq["q_ru"]):
+                    lst = _topic_word_list(q)
+                    pairs |= set(zip(lst, lst[1:]))
+                _FAQ_INDEX.append((words, faq, answer_fn, rank, pairs))
+                for w in words:
+                    _WORD_HITS[w] = _WORD_HITS.get(w, 0) + 1
+    return _FAQ_INDEX
+
+
+def _assisted_faq_answer(text, roman_urdu):
+    """Stage-2 FAQ matching for natural or misspelled phrasings the
+    strict matchers miss. The question's topic words are scored
+    against all 740 canonical questions (coverage = share of the
+    user's topic words the FAQ's question also uses). Acceptance
+    needs coverage >= 60% AND a decisive win: a clear margin over the
+    runner-up, very high coverage, or a strict win on the tie-breaks
+    (smaller/more general canonical question, then more distinctive
+    overlapping words). FAQs about a named product/portal the user
+    never mentioned are only used when no clean candidate reaches
+    60% - so one similar word can never hijack an answer."""
+    user_words = _topic_words(text)
+    if not user_words:
+        return None
+    _faq_index()
+    if len(user_words) == 1:
+        # A single topic word is enough only when it is distinctive
+        # (used by few FAQs) and not a generic word like 'help' -
+        # a lone generic word gets a clarification, not a guess.
+        w = next(iter(user_words))
+        if w in _SINGLE_WORD_BLOCK or _WORD_HITS.get(w, 99) > 25:
+            return None
+    # Concept expansion for scoring only: a thesis question is also
+    # about dissertations (the FAQ category's own wording), so both
+    # words count for overlap - but coverage is still measured
+    # against the words the user actually used.
+    expanded = set(user_words)
+    if "thesis" in expanded:
+        expanded.add("dissertation")
+    user_list = _topic_word_list(text)
+    user_pairs = set(zip(user_list, user_list[1:]))
+    scored = []
+    for pos, (words, faq, answer_fn, rank, pairs) in \
+            enumerate(_FAQ_INDEX):
+        overlap = expanded & words
+        if len(overlap) >= 2 or (len(user_words) == 1 and overlap):
+            idf = sum(1.0 / _WORD_HITS[w] for w in overlap)
+            # Phrase bonus: an FAQ whose question uses the user's
+            # own two-word phrase ('research paper', 'thesis write')
+            # is about exactly that thing, not just the words. A
+            # pair of two ultra-common words ('use library') is not
+            # a phrase and earns no bonus.
+            bonus = 1 if any(
+                p in pairs and not (p[0] in _PAIR_BLOCK
+                                    and p[1] in _PAIR_BLOCK)
+                for p in user_pairs) else 0
+            cov = min(1.0, (len(overlap) + bonus) / len(user_words))
+            scored.append((cov, len(words), idf, rank,
+                           frozenset(overlap), words, faq, answer_fn,
+                           pos))
+    if scored:
+        clean = [s for s in scored
+                 if not ((s[5] & _SPECIFIC_ENTITIES) - user_words)]
+        pool = clean if any(s[0] >= 0.6 for s in clean) else scored
+        # Winner order: coverage, then - among equals - an FAQ whose
+        # overlap covers ALL of the user's distinctive words (used
+        # by <= 5 FAQs, e.g. 'harvard': the Harvard FAQ must beat a
+        # generic APA FAQ that merely shares 'style'), then the
+        # more general (smaller) canonical question, then IDF,
+        # then earlier module (official before general guidance).
+        _distinct = {w for w in user_words
+                     if _WORD_HITS.get(w, 99) <= 5}
+        pool.sort(key=lambda s: (
+            -s[0],
+            0 if _distinct and _distinct <= set(s[4]) else 1,
+            s[1], -s[2], s[3], s[8]))
+        best_cov, best_size, best_idf, best_rank, best_ov = pool[0][:5]
+        if best_cov >= 0.6:
+            rivals = [s for s in pool[1:] if best_cov - s[0] < 0.12]
+            decisive = (
+                not rivals
+                or best_cov >= 0.75
+                or (best_cov >= 0.66 and all(
+                    s[1] > best_size
+                    or (s[1] == best_size and s[2] < best_idf)
+                    or (s[1] == best_size and s[2] == best_idf
+                        and s[3] > best_rank)
+                    or (s[1] == best_size and s[2] == best_idf
+                        and s[3] == best_rank and s[4] == best_ov)
+                    for s in rivals))
+            )
+            if decisive:
+                return pool[0][7](pool[0][6]["q_en"], roman_urdu)
+    # Fallback 1: the user named ONE specific product/platform that
+    # only a few FAQs cover ('coursera par course karna hai') - the
+    # most general of those FAQs is the right answer.
+    ents = [w for w in user_words
+            if w in _SPECIFIC_ENTITIES and _WORD_HITS.get(w, 99) <= 6]
+    if len(ents) == 1:
+        cands = [(len(words), rank, pos, faq, answer_fn)
+                 for pos, (words, faq, answer_fn, rank, _p)
+                 in enumerate(_FAQ_INDEX) if ents[0] in words]
+        if cands:
+            cands.sort()
+            return cands[0][4](cands[0][3]["q_en"], roman_urdu)
+    # Fallback 2: a very distinctive word (used by at most 2 of the
+    # 740 FAQs, e.g. 'interview') - the FAQ that uses it is almost
+    # certainly the one the user means.
+    rare = [w for w in user_words if _WORD_HITS.get(w, 99) <= 2]
+    if rare:
+        cands = []
+        for pos, (words, faq, answer_fn, rank, _p) in \
+                enumerate(_FAQ_INDEX):
+            hits = len(set(rare) & words)
+            if hits:
+                cands.append((-hits, len(words), rank, pos, faq,
+                              answer_fn))
+        if cands:
+            cands.sort()
+            return cands[0][5](cands[0][4]["q_en"], roman_urdu)
+    return None
+
+
+_BOOK_INTENT_TOKENS = {"book", "books", "kitab", "kitaab", "novel",
+                       "novels", "textbook", "textbooks"}
+_GENERIC_TOKENS = {"library", "science", "studies", "study", "system",
+                   "systems", "introduction", "management", "university",
+                   "research", "education", "learning", "general"}
+_CATALOGUE_TOKENS = None
+
+
+def _catalogue_tokens():
+    """Signals from the real demo catalogue, built once:
+    - author words (in at most 6 of the 80 books): a strong book
+      signal at any query length - nobody asks about 'Tanenbaum'
+      except for his books;
+    - the exact normalized titles: typing a book's full title IS a
+      book question, however many words it has ('Python Crash
+      Course', 'Operating System Concepts');
+    - distinctive title/subject words: a book signal only in SHORT
+      queries ('python', 'data structures') - in a longer sentence
+      the same word is usually a topic, not a book request ('thesis
+      likhne mein madad chahiye' asks for help, not a book);
+    - any word appearing in a title: enough for a one-word query
+      ('management', 'algorithms') - except ambient words about the
+      library itself ('library' alone asks for clarification)."""
+    global _CATALOGUE_TOKENS
+    if _CATALOGUE_TOKENS is None:
+        author_counts, title_counts = {}, {}
+        titles, title_words = set(), set()
+        for subject in count_by_subject():
+            for b in search_books(subject, search_by="subject"):
+                titles.add(_normalize_query(b["title"]))
+                for w in set(re.findall(r"[a-z]+", b["author"].lower())):
+                    author_counts[w] = author_counts.get(w, 0) + 1
+                for w in set(re.findall(r"[a-z]+", b["title"].lower())):
+                    title_words.add(w)
+                    title_counts[w] = title_counts.get(w, 0) + 1
+                for w in set(re.findall(r"[a-z]+", b["subject"].lower())):
+                    title_counts[w] = title_counts.get(w, 0) + 1
+        pick = lambda counts: {
+            w for w, c in counts.items()
+            if len(w) >= 4 and c <= 6 and w not in _GENERIC_TOKENS
+        }
+        _CATALOGUE_TOKENS = (pick(author_counts), pick(title_counts),
+                             titles, title_words)
+    return _CATALOGUE_TOKENS
+
+
+def _has_book_intent(text, norm):
+    """Book results are ONLY for book questions: an explicit book word,
+    a quoted title, an author pattern or name, an exact catalogue
+    title, or a distinctive catalogue word in a short query.
+    Everything else must never reach the book search."""
+    tokens = set(norm.split())
+    if "open access" in norm:
+        return False  # a digital-resources concept, never a book
+        # search - even though a demo title contains the word 'Access'
+    if _BOOK_INTENT_TOKENS & tokens:
+        return True
+    if '"' in text or " by " in f" {norm} ":
+        return True
+    author_tokens, title_tokens, titles, title_words = \
+        _catalogue_tokens()
+    if tokens & author_tokens or norm in titles:
+        return True
+    # A catalogue title named inside a longer question is still a
+    # book question ('kya Clean Code available hai?').
+    padded = f" {norm} "
+    if any(f" {t} " in padded for t in titles if len(t) >= 4):
+        return True
+    # Two or more consecutive Capitalized words usually name a book
+    # ('Harry Potter hai library mein?') - unless they name a known
+    # non-book service or product.
+    for pair in re.findall(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+", text):
+        if pair.lower() not in ("google scholar", "hec digital",
+                                "digital library", "research support",
+                                "reference manager", "library ai"):
+            return True
+    # A distinctive catalogue word in a short query is a book signal -
+    # UNLESS the query names a specific product/platform that has its
+    # own FAQs ('coursera par course karna hai' is about Coursera,
+    # not the book 'Python Crash Course'), or the query's other topic
+    # words are not catalogue words at all ('assignment likh kar de
+    # dein' contains the title word 'write' but is not a book ask).
+    if tokens & _SPECIFIC_ENTITIES:
+        return False
+    if len(_topic_words(text)) <= 2 and tokens & title_tokens:
+        stem = lambda w: w[:-1] if len(w) > 3 and w.endswith("s") \
+            and not w.endswith("ss") and w not in _NO_STEM else w
+        catalogue_words = {stem(w) for w in title_tokens} \
+            | {stem(w) for w in author_tokens} \
+            | _GENERIC_TOKENS | _BOOK_INTENT_TOKENS
+        if _topic_words(text) <= catalogue_words:
+            return True
+    return len(tokens) == 1 and bool(tokens & title_words) \
+        and tokens != {"library"}
+
+
+def _clarification_reply(roman_urdu):
+    """Short, relevant clarification instead of a generic paragraph or
+    a wrong answer, when no intent could be identified."""
+    if roman_urdu:
+        return (
+            "Aap ka sawal mujhe poori tarah samajh nahi aaya - zara si "
+            "wazahat kar dein, taake main bilkul sahi jawab dun. Aap kis "
+            "baare mein poochna chahte hain?\n"
+            "- Kitabein (title, author ya subject se search)\n"
+            "- Library timings ya contact details\n"
+            "- Library services aur facilities\n"
+            "- Digital resources (HEC Digital Library, Google Scholar, e-books)\n"
+            "Misal: 'Mujhe Python ki kitab chahiye' ya 'Library kab band hoti hai?'"
+        )
+    return (
+        "I want to make sure I answer exactly what you asked. Could you "
+        "say a little more - what would you like to ask about?\n"
+        "- Books (search by title, author or subject)\n"
+        "- Library hours or contact details\n"
+        "- Library services and facilities\n"
+        "- Digital resources (HEC Digital Library, Google Scholar, e-books)\n"
+        "I can also answer from 740 built-in FAQs. Try e.g. 'Find Python "
+        "books' or 'What time does the library close?'"
+    )
+
+
+def get_reply(user_text, history=None):
+    """Main brain, in order: explicit demo-policy request, greetings,
+    strict FAQ modules, unpublished-policy honesty, multi-topic and
+    assisted FAQ matching, official facts, circulation, GATED SQLite
+    book search (book questions only), Groq/clarification."""
     text = user_text.strip()
     low = text.lower()
     roman_urdu = is_roman_urdu(text)
@@ -426,6 +1282,43 @@ def get_reply(user_text):
         key = _demo_policy_key(low)
         if key:
             return f"{DEMO_LABEL}\n\n{DEMO_POLICY_ANSWERS[key]}"
+
+    norm = _normalize_query(text)
+    norm_tokens = norm.split()
+
+    # 1b. Thanks and greeting-only messages get a natural reply. A
+    # greeting followed by a real question falls through, so the
+    # question itself - not the greeting - is answered.
+    if norm in _THANKS:
+        if roman_urdu or norm.split()[0] in ("shukriya", "jazakallah", "jazak"):
+            return "Khushi hui madad karke! Agar library, kitabon ya digital resources ke baare mein aur kuch poochna ho to main hazir hoon."
+        return "You're welcome! If you need anything else about the library, books or digital resources, just ask."
+    # 1c. Pirated-site questions get the stored warning answer
+    # (DL100: pirate libraries such as LibGen distribute copyrighted
+    # material illegally) before anything else can claim them -
+    # never a book search, never a recommendation.
+    if "libgen" in norm_tokens or "sci-hub" in norm_tokens or (
+            "sci" in norm_tokens and "hub" in norm_tokens):
+        for _f in DIGITAL_FAQS:
+            if _f["id"] == "DL100":
+                return digital_faq_answer(_f["q_en"], roman_urdu)
+
+    # 1d. 'Write my assignment for me' delegation requests get the
+    # honest stored answer (AC10: the library helps you learn to do
+    # it, it does not do it for you) - not a random writing FAQ.
+    if ("assignment" in norm or "homework" in norm) and (
+            re.search(r"\b(likh|bana|kar|solve) (kar )?(de|do|dein)\b",
+                      norm)
+            or "write my" in norm or "do my" in norm):
+        for _f in ACADEMIC_FAQS:
+            if _f["id"] == "AC10":
+                return academic_faq_answer(_f["q_en"], roman_urdu)
+
+    remainder = _greeting_remainder(norm)
+    if remainder is not None and remainder in _SMALLTALK_REMAINDERS:
+        if roman_urdu or norm.split()[0] in ("salam", "aoa", "assalam", "assalamualaikum"):
+            return "Wa Alaikum Assalam! Main UOS Library AI hoon. Aap demo catalogue mein kitab search kar sakte hain, ya official library timing, services, Turnitin aur contact ke baare mein pooch sakte hain."
+        return "Hello! I am UOS Library AI. You can search the demo book catalogue, or ask about official library hours, services, Turnitin and contact details."
 
     # 2. Rules & Regulations FAQs (library_faq.py) - official Code of
     # Conduct / payment form / information page answers. The matcher is
@@ -478,13 +1371,65 @@ def get_reply(user_text):
     # Checked BEFORE the official routes: "How many books can I borrow?"
     # is a borrow-limit question, not a collections question.
     for keywords, _key, topic_en, topic_ur in POLICY_ROUTES:
-        if any(k in low for k in keywords):
+        if any(k in low or k in norm for k in keywords):
             return policy_not_published(topic_en, topic_ur, roman_urdu)
 
+    # 3b. Two official topics in one message: answer each part
+    # separately (e.g. closing time AND contact number).
+    multi = _multi_fact_reply(norm, roman_urdu)
+    if multi:
+        return multi
+
     # 4. Official verified information (library_info.py), with sources.
+    # Keywords are checked against the original text AND the
+    # spelling-normalized text, so 'servise' still finds services.
     for keywords, key in OFFICIAL_ROUTES:
-        if any(k in low for k in keywords):
+        if key == "contact" and _phone_use_question(norm_tokens):
+            continue
+        if key == "services" and "reference manager" in norm:
+            continue  # a reference MANAGER (Zotero/Mendeley) question,
+            # not the library's reference service - assisted matching
+            # below owns it
+        if key == "services" and set(norm_tokens) & {
+                "apa", "harvard", "citation", "mla", "chicago",
+                "vancouver", "referencing"}:
+            continue  # a CITATION-style question ('apa format mein
+            # reference kaise banaun?'), not the library's reference
+            # service - the academic FAQs own it
+        if key == "hours" and "open access" in norm:
+            continue  # 'open access kya hai?' is a digital-resources
+            # question, not an opening-hours question
+        if any(k in low or k in norm for k in keywords):
             return get_fact(key, roman_urdu)
+
+    # 4a. Overview questions ('which services are available?', 'kon
+    # kon si sahulat hain?') that no route caught get the verified
+    # services/facilities overview - never a book answer.
+    overview = _overview_fact_key(norm_tokens)
+    if overview:
+        return get_fact(overview, roman_urdu)
+
+    # 4c. Assisted FAQ matching (stage 2): natural or misspelled
+    # phrasings the strict matchers missed. Runs after the official
+    # routes (which own hours/contact/etc.), and the contact route
+    # above is guarded, so a mobile-phone RULE question reaches the
+    # rules FAQ here instead of being hijacked by the word 'phone'.
+    # Skipped for clear book questions - those belong to the book
+    # search below ('Find Python books' must return books, not an
+    # FAQ that happens to share the words 'find' and 'book'). Two
+    # exceptions: citation-style questions that merely MENTION a
+    # book ('apa mein book ka reference kaise banta hai?') and
+    # own-book rule questions ('apni kitab parh sakte hain?') are
+    # FAQ questions, not catalogue searches.
+    _cite_ctx = bool(set(norm_tokens) & {
+        "apa", "harvard", "citation", "mla", "chicago", "vancouver",
+        "referencing"})
+    _own_ctx = "apni kitab" in low or "apni book" in low \
+        or "own book" in low
+    if _cite_ctx or _own_ctx or not _has_book_intent(text, norm):
+        assisted = _assisted_faq_answer(text, roman_urdu)
+        if assisted:
+            return assisted
 
     # 4b. Borrowing / returning process: the official circulation-desk
     # answer (limits themselves stay unpublished - see step 3).
@@ -547,57 +1492,50 @@ def get_reply(user_text):
                 _recommendation_block(books[0], books, roman_urdu)
                 if len(books) <= 3 else "")
 
-    # 5e. General search: whole text first, then each word
-    # longest-first, so "Mujhe Python ki kitab chahiye" finds Python
-    # (not "chahiye"). Results are ranked (exact title > title >
-    # author > subject) and ALL matches are shown.
-    words = sorted({w.strip("?.!,") for w in text.split()}, key=len, reverse=True)
-    for query in [text] + words:
-        if len(query) < 3 or query.lower() in SEARCH_STOPWORDS:
-            continue
-        books = search_books(query)
-        if books:
-            books = _rank_books(books, query)
-            reply = format_books(books, roman_urdu)
-            if len(books) <= 3:
-                reply += _recommendation_block(books[0], books, roman_urdu)
-            return reply
+    # 5e. General search - GATED: this step runs ONLY when the user is
+    # actually asking about books (explicit book words, a quoted
+    # title, an author pattern, or a distinctive catalogue word).
+    # A non-book question must never be answered with book results.
+    # Whole text first, then each word longest-first, so "Mujhe Python
+    # ki kitab chahiye" finds Python (not "chahiye"). Results are
+    # ranked (exact title > title > author > subject), ALL shown.
+    if _has_book_intent(text, norm) and not _cite_ctx and not _own_ctx:
+        words = sorted({w.strip("?.!,") for w in text.split()}, key=len, reverse=True)
+        for query in [text] + words:
+            if len(query) < 3 or query.lower() in SEARCH_STOPWORDS:
+                continue
+            books = search_books(query)
+            if books:
+                books = _rank_books(books, query)
+                reply = format_books(books, roman_urdu)
+                if len(books) <= 3:
+                    reply += _recommendation_block(books[0], books, roman_urdu)
+                return reply
 
-    # 5f. Not found: honest message + spelling/subject suggestions.
-    if any(w in low for w in ["book", "kitab", "kitaab", "author", "subject", "search", "find", "available", "availability"]) \
-            or any(topic in low for topic in TOPIC_TO_SUBJECT):
+        # 5f. Book question, nothing found: honest not-found +
+        # spelling/subject suggestions. Only reachable inside the
+        # gate, i.e. for genuine book questions ('Harry Potter hai
+        # library mein?' gets not-found, not a clarification).
         return _not_found_reply(text, low, roman_urdu)
 
-    # 4. Greetings / general chat
-    if low in ("hi", "hello", "salam", "assalam o alaikum", "aoa"):
-        if roman_urdu:
-            return "Wa Alaikum Assalam! Main UOS Library AI hoon. Aap demo catalogue mein kitab search kar sakte hain, ya official library timing, services, Turnitin aur contact ke baare mein pooch sakte hain."
-        return "Hello! I am UOS Library AI. You can search the demo book catalogue, or ask about official library hours, services, Turnitin and contact details."
-
-    ai_reply = ask_groq_or_fallback(text, roman_urdu)
+    # 6. General chat via Groq when a key exists (never for book
+    # availability), otherwise a short clarification question - a
+    # student should never get an unrelated answer or a generic
+    # paragraph when a specific answer exists.
+    ai_reply = ask_groq_or_fallback(text, roman_urdu, history=history)
     if ai_reply:
         return ai_reply
 
-    if roman_urdu:
-        return (
-            "Main aapki madad kar sakta hoon: demo catalogue mein kitab search karein (title, author ya subject se), "
-            "ya poochein - library timing, services, Turnitin, e-books, HEC Digital Library ya contact."
-        )
-    return (
-        "I can help you search the demo book catalogue (by title, author or subject), "
-        "answer about official library hours, services, Turnitin, e-books, the HEC Digital Library and contact details, "
-        "or answer from 740 built-in FAQs (100 Rules & Regulations, 60 Facilities & Services, "
-        "80 Academic & Research Assistance, 500 Digital Library & Online Resources). "
-        "Try e.g. 'Find Python books', 'What time does the library open?' or 'Can I bring a bag?'"
-    )
+    return _clarification_reply(roman_urdu)
 
 
-# ---------- Multiple-chat history (session-only) ----------
-# Chats live in st.session_state only, like ChatGPT without an account.
-# They are kept separately for the whole active browser session, but
-# are NOT saved to disk/database, so they are gone when the tab closes.
-# That is deliberate for this no-login demo: a shared database would
-# show one visitor's chats to every other visitor.
+# ---------- Multiple-chat history ----------
+# Chats live in st.session_state while the app runs. GUESTS stay
+# session-only: nothing is written anywhere, chats vanish with the
+# tab. SIGNED-IN STUDENTS (Stage 4) get the same in-session chats
+# mirrored to their private Supabase account - every query there
+# is filtered by their user id AND protected by Row Level
+# Security, so no student can ever see another's chats.
 GREETING = {
     "role": "assistant",
     "content": "Hello! 👋 I am **UOS Library AI**. Ask me to find a book in the demo catalogue, or ask about official library hours, services, Turnitin and contact details. Try: *Find Python books*",
@@ -676,6 +1614,259 @@ def set_chat_title_from_first_question(prompt):
         chat["title"] = title[:32] + "..." if len(title) > 32 else title
 
 
+# ---------- Stage 4: student accounts & permanent history ----------
+# All database work goes through supabase_store (anon key + the
+# student's own session; RLS enforces ownership in the database).
+# Guests never touch it: no rows are written for them, ever.
+
+def _accounts_on():
+    return store is not None and store.accounts_enabled()
+
+
+def _sb_user():
+    """{'id', 'email'} of the signed-in student, or None (guest)."""
+    return st.session_state.get("sb_user")
+
+
+def _sb_client():
+    """The signed-in student's Supabase client (restored from the
+    session tokens when needed), or None."""
+    if not _accounts_on():
+        return None
+    client = st.session_state.get("sb_client")
+    if client is not None:
+        return client
+    tokens = st.session_state.get("sb_tokens")
+    if tokens:
+        client = store.restore_client(tokens[0], tokens[1])
+        if client is not None:
+            st.session_state.sb_client = client
+            return client
+    return None
+
+
+def _notice(kind, text):
+    st.session_state.sb_notice = (kind, text)
+
+
+def _load_db_chats(client, user):
+    """Replace the session chats with the student's saved ones
+    (titles + timestamps come from the database; the static
+    greeting is prepended locally - it is never stored)."""
+    chats = {}
+    convs = store.list_conversations(client, user["id"])
+    for i, conv in enumerate(reversed(convs)):
+        msgs = [dict(GREETING)]
+        for m in store.get_messages(client, user["id"], conv["id"]):
+            if m.get("role") in ("user", "assistant"):
+                msgs.append({"role": m["role"],
+                             "content": m["content"]})
+        cid = uuid.uuid4().hex[:8]
+        chats[cid] = {"title": conv.get("title") or "New chat",
+                      "messages": msgs, "last_active": i + 1,
+                      "db_id": conv["id"],
+                      "updated_at": conv.get("updated_at")}
+    st.session_state.chats = chats
+    st.session_state.activity_counter = len(chats)
+    if chats:
+        current = max(chats,
+                      key=lambda c: chats[c].get("last_active", 0))
+        st.session_state.current_chat_id = current
+        st.session_state.messages = chats[current]["messages"]
+    else:
+        start_new_chat()
+
+
+def _after_auth(session, client, notice_text):
+    """Common success path for login / register / recovery."""
+    user = {"id": session["user_id"], "email": session["email"]}
+    st.session_state.sb_user = user
+    st.session_state.sb_client = client
+    if session.get("access_token"):
+        st.session_state.sb_tokens = (
+            session["access_token"], session["refresh_token"])
+    store.ensure_profile(client, user["id"], user["email"])
+    _load_db_chats(client, user)
+    _notice("success", notice_text)
+
+
+def _do_sign_out():
+    client = _sb_client()
+    if client is not None:
+        store.sign_out(client)
+    for key in ("sb_user", "sb_client", "sb_tokens", "sb_recovery"):
+        st.session_state.pop(key, None)
+    st.session_state.chats = {}
+    start_new_chat()
+    _notice("success",
+            "You have been signed out. You are now a guest; new "
+            "chats will not be saved.")
+
+
+def _persist_exchange(prompt, reply):
+    """Save the just-finished exchange for a signed-in student
+    (creating the conversation row on its first exchange). Guests:
+    nothing is stored anywhere."""
+    user = _sb_user()
+    if not user:
+        return
+    client = _sb_client()
+    if client is None:
+        return
+    chat = st.session_state.chats.get(
+        st.session_state.current_chat_id)
+    if chat is None:
+        return
+    db_id = chat.get("db_id")
+    if not db_id:
+        db_id = store.create_conversation(
+            client, user["id"], chat.get("title") or "New chat")
+        if db_id:
+            chat["db_id"] = db_id
+    if not db_id:
+        return
+    store.append_message(client, user["id"], db_id, "user", prompt)
+    store.append_message(client, user["id"], db_id, "assistant", reply)
+    store.update_conversation(client, user["id"], db_id,
+                              chat.get("title"))
+
+
+def _delete_chat(chat_id):
+    """Delete one chat: its database row too, when signed in
+    (messages are removed by the database cascade)."""
+    chat = st.session_state.chats.get(chat_id)
+    if chat is None:
+        return
+    user = _sb_user()
+    if user and chat.get("db_id"):
+        client = _sb_client()
+        if client is not None:
+            store.delete_conversation(client, user["id"],
+                                      chat["db_id"])
+    del st.session_state.chats[chat_id]
+    if st.session_state.get("current_chat_id") == chat_id:
+        if st.session_state.chats:
+            open_chat(max(
+                st.session_state.chats,
+                key=lambda c: st.session_state.chats[c].get(
+                    "last_active", 0)))
+        else:
+            start_new_chat()
+
+
+def _account_panel():
+    """Sidebar Student Account section: guest note, login /
+    register / forgot-password form, or the signed-in controls
+    (logout + delete a saved chat)."""
+    T = _t()
+    with st.expander(T["account"]):
+        notice = st.session_state.pop("sb_notice", None)
+        if notice:
+            (st.success if notice[0] == "success" else st.error)(
+                notice[1])
+        if not _accounts_on():
+            st.caption(T["accounts_off"])
+            return
+        user = _sb_user()
+        if user and st.session_state.get("sb_recovery"):
+            st.write("Set a new password for "
+                     f"**{user['email']}**:")
+            with st.form("sb_newpw"):
+                new_pw = st.text_input("New password",
+                                       type="password")
+                save = st.form_submit_button("Set new password")
+            if save:
+                client = _sb_client()
+                if client is not None and store.update_password(
+                        client, new_pw):
+                    st.session_state.pop("sb_recovery", None)
+                    _notice("success", "Your password has been "
+                                       "updated.")
+                else:
+                    _notice("error", "Could not update the password "
+                                     "- please try the reset link "
+                                     "again.")
+                st.rerun()
+            return
+        if user:
+            st.caption(f"{T['signed_in']} {user['email']}")
+            if st.button(T["logout"], key="sb_logout",
+                         use_container_width=True):
+                _do_sign_out()
+                st.rerun()
+            items = sorted_chat_items()
+            if items:
+                labels = {cid: c["title"] for cid, c in items}
+                sel = st.selectbox(
+                    "Delete a chat", list(labels),
+                    format_func=lambda cid: labels[cid],
+                    key="sb_del_sel", label_visibility="collapsed")
+                if st.button(T["delete_chat"], key="sb_del",
+                             use_container_width=True):
+                    _delete_chat(sel)
+                    _notice("success", "Chat deleted.")
+                    st.rerun()
+            return
+        st.caption(T["guest_note"])
+        with st.form("sb_auth"):
+            email = st.text_input(T["email"], key="sb_email")
+            password = st.text_input(T["password"], type="password",
+                                     key="sb_pw")
+            c1, c2 = st.columns(2)
+            login = c1.form_submit_button(T["login"],
+                                          use_container_width=True)
+            register = c2.form_submit_button(
+                T["register"], use_container_width=True)
+            forgot = st.form_submit_button(T["forgot"])
+        if login or register or forgot:
+            client = store.new_client()
+            if client is None:
+                _notice("error", "Accounts are unavailable right "
+                                 "now - please continue as a guest.")
+            elif forgot:
+                redirect = None
+                try:
+                    redirect = st.secrets.get("APP_URL")
+                except Exception:
+                    redirect = None
+                if email and store.send_password_reset(
+                        client, email, redirect):
+                    _notice("success",
+                            "If that email is registered, a "
+                            "password-reset link has been sent to "
+                            "it.")
+                else:
+                    _notice("error", "Please enter your email "
+                                     "first.")
+            elif login:
+                session = store.sign_in(client, email, password)
+                if session and not session["needs_confirmation"]:
+                    _after_auth(session, client,
+                                "Welcome back! Your saved chats "
+                                "are loaded.")
+                else:
+                    _notice("error", "Login failed - check the "
+                                     "email and password (or "
+                                     "confirm your email first).")
+            else:  # register
+                session = store.sign_up(client, email, password)
+                if session is None:
+                    _notice("error",
+                            "Registration failed - the email may "
+                            "already be registered, or the password "
+                            "is too short (minimum 6 characters).")
+                elif session["needs_confirmation"]:
+                    _notice("success",
+                            "Account created. Please open the "
+                            "confirmation link in your email, then "
+                            "log in.")
+                else:
+                    _after_auth(session, client,
+                                "Account created - your chats will "
+                                "now be saved permanently.")
+            st.rerun()
+
+
 # ---------- Streamlit UI (redesigned 2026-11-23) ----------
 # Frontend redesign approved by the user against a supplied visual
 # reference: dark navy sidebar, light welcome dashboard with four
@@ -731,6 +1922,14 @@ UI_TEXT = {
         "placeholder": "Ask anything about your library...",
         "subjects": "Demo catalogue subjects",
         "links": "Official links",
+        "account": "Student Account", "email": "Email",
+        "password": "Password", "login": "Log in",
+        "register": "Register", "logout": "Log out",
+        "forgot": "Forgot password",
+        "guest_note": "Guest mode: chats stay only for this session and are not saved. Register to save your chats permanently.",
+        "signed_in": "Signed in as",
+        "delete_chat": "Delete selected chat",
+        "accounts_off": "Student accounts are not configured on this deployment, so you are chatting as a guest and chats are not saved.",
     },
     "Roman Urdu": {
         "tagline": "Your Smart Library Assistant",
@@ -745,6 +1944,14 @@ UI_TEXT = {
         "placeholder": "Apni library ke bare mein kuch bhi poochein...",
         "subjects": "Demo catalogue subjects",
         "links": "Official links",
+        "account": "Student Account", "email": "Email",
+        "password": "Password", "login": "Log in",
+        "register": "Register", "logout": "Log out",
+        "forgot": "Forgot password",
+        "guest_note": "Guest mode: chats sirf is session ke liye hain, save nahi hoti. Chats hamesha ke liye save karne ke liye register karein.",
+        "signed_in": "Signed in as",
+        "delete_chat": "Delete selected chat",
+        "accounts_off": "Is deployment par student accounts configured nahi hain, is liye aap guest ke tor par chat kar rahe hain aur chats save nahi hoti.",
     },
 }
 
@@ -825,7 +2032,9 @@ HELP_TEXT = (
     "Support Lab and Turnitin, e.g. *What time does the library open?*\n\n"
     "You can ask in **English or Roman Urdu** — the assistant replies in the "
     "same language. Use **New Chat** to start a separate conversation; "
-    "previous chats stay available in the sidebar during this session."
+    "previous chats stay available in the sidebar during this session. "
+    "Students who register in the **Student Account** panel get their "
+    "chats saved permanently and privately; guests are not saved."
 )
 
 DISCLAIMER = (
@@ -999,6 +2208,9 @@ def _sidebar():
                 _submit(card[6] if ru == 0 else card[7])
                 st.rerun()
         st.divider()
+        # --- Student Account (Stage 4: guest / login / saved chats) ---
+        _account_panel()
+        st.divider()
         # --- Language & theme selectors (session-persistent) ---
         st.markdown(f"**{T['language']}**")
         st.segmented_control(
@@ -1079,6 +2291,29 @@ def main():
         init_db()
 
     ensure_chat_state()
+    # Stage 4: a password-reset / email-confirmation link returns
+    # to the app with ?code=... - exchange it for a session and
+    # flag the recovery so the account panel offers a new-password
+    # form. Runs once; the code is removed from the URL afterwards.
+    if _accounts_on() and not _sb_user():
+        try:
+            _code = st.query_params.get("code")
+        except Exception:
+            _code = None
+        if _code:
+            _client = store.new_client()
+            _session = (store.exchange_code(_client, _code)
+                        if _client is not None else None)
+            if _session and _session.get("access_token"):
+                _after_auth(_session, _client,
+                            "Link verified. Set a new password "
+                            "from the Student Account panel in "
+                            "the sidebar.")
+                st.session_state.sb_recovery = True
+            try:
+                del st.query_params["code"]
+            except Exception:
+                pass
     if "view" not in st.session_state:
         st.session_state.view = "home"
     if "ui_lang" not in st.session_state:
@@ -1106,10 +2341,16 @@ def main():
             "Your other chats in this session are not touched."
         )
         if st.button("Yes, clear this chat", key="clear_confirm"):
-            chat = st.session_state.chats[st.session_state.current_chat_id]
-            chat["messages"] = [dict(GREETING)]
-            chat["title"] = "New chat"
-            st.session_state.messages = chat["messages"]
+            chat_id = st.session_state.current_chat_id
+            chat = st.session_state.chats[chat_id]
+            if _sb_user() and chat.get("db_id"):
+                # Signed in: clearing removes the saved
+                # conversation entirely (database + sidebar).
+                _delete_chat(chat_id)
+            else:
+                chat["messages"] = [dict(GREETING)]
+                chat["title"] = "New chat"
+                st.session_state.messages = chat["messages"]
             st.session_state.view = "home"
             st.rerun()
 
@@ -1146,8 +2387,14 @@ def main():
         set_chat_title_from_first_question(prompt)
         touch_current_chat()
         st.session_state.messages.append({"role": "user", "content": prompt})
-        reply = get_reply(prompt)
+        # Conversation history (this chat only) lets the Groq layer
+        # understand follow-ups; deterministic layers ignore it.
+        reply = get_reply(prompt,
+                          history=st.session_state.messages[:-1])
         st.session_state.messages.append({"role": "assistant", "content": reply})
+        # Stage 4: save the exchange to the student's account
+        # (no-op for guests - nothing is stored for them).
+        _persist_exchange(prompt, reply)
         st.session_state.view = "chat"
         st.rerun()
 

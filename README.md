@@ -137,8 +137,10 @@ not write their assignments or theses.
 - ChatGPT-style chat interface, New Chat button, and multiple separate
   conversations in the sidebar (titles from the first question, most
   recently active conversation first, click to reopen and continue).
-  Chats are session-only: they are kept while the browser session is
-  active and are not saved after the tab is closed.
+  **Guests** are session-only: their chats are kept while the browser
+  session is active and are never saved. **Registered students**
+  (Stage 4, optional) get their chats saved permanently and
+  privately in Supabase — see "Student accounts" below.
 - Search books by title, author and subject
 - Check book availability — **always from SQLite only, never invented by AI**
 - Official Wazir Agha Library information with source links: hours, contact,
@@ -266,7 +268,11 @@ subject can be browsed in full. No book, author, ISBN or availability
 value is ever invented — everything comes from the 80 demo records.
 - `database.py` — SQLite database + 80 demo books + search functions
 - `library.db` — created automatically when the app first runs
-- `requirements.txt` — Streamlit + Groq
+- `supabase_store.py` — Stage 4 data layer: student accounts
+  (Supabase Auth) and permanent private chat history
+- `supabase_schema.sql` — Stage 4 database schema + Row Level
+  Security policies (run once in the Supabase SQL Editor)
+- `requirements.txt` — Streamlit + Groq + Supabase
 - `.gitignore` — keeps Python cache, virtual environments and
   `.streamlit/secrets.toml` (API keys) out of GitHub
 
@@ -299,5 +305,50 @@ Without a key the app still works fully for book search and all library informat
 2. Sign in at share.streamlit.io with GitHub, select that repo, branch `main`, file `app.py`
 3. Deploy — you get a public link
 
-## No student login system
-By design — no login, no real borrowing transactions, no payments.
+## Student accounts (Stage 4, Supabase)
+
+Optional student accounts with **permanent, private chat history**,
+built on Supabase (free tier). Guest mode always works — with no
+Supabase configuration at all, the app behaves exactly as before
+and **guest chats are never saved**.
+
+- Students register and log in with email + password from the
+  sidebar **Student Account** panel. Passwords are handled and
+  hashed only by Supabase Auth — the app never stores or logs a
+  password. A password-reset flow (email link → set new password)
+  is included.
+- Signed-in students' conversations are saved automatically,
+  listed with titles and timestamps, can be reopened and
+  continued, and can be deleted by their owner. Recent context is
+  preserved for the Groq AI replies.
+- **Privacy:** every table has Row Level Security enabled and
+  every policy is scoped to the authenticated student's own id
+  (`auth.uid()`), so a student can only ever access their own
+  conversations — even with a guessed conversation id. The app
+  uses only the public anon key plus the student's own session;
+  the service-role key is never used.
+
+### Supabase setup (one time, free)
+1. Create a free project at supabase.com (no card required).
+2. In the project's **SQL Editor**, paste and run
+   `supabase_schema.sql` (creates the tables, indexes and RLS
+   policies).
+3. **Authentication → URL Configuration:** set the Site URL (and
+   redirect URLs) to this app's deployed address, so
+   password-reset links return here.
+4. Add two secrets (Streamlit Cloud → Settings → Secrets, or
+   `.streamlit/secrets.toml` locally):
+   ```toml
+   SUPABASE_URL = "https://your-project.supabase.co"
+   SUPABASE_ANON_KEY = "your-anon-public-key"
+   ```
+   Use only the **anon public** key — never the service-role key.
+5. For a smoother class demo, email confirmation can be turned
+   off under Authentication → Providers → Email; the app works
+   either way.
+
+Free-tier note: free Supabase projects pause after about a week
+of inactivity and can be restored from the Supabase dashboard;
+while paused (or unconfigured), the app simply runs in guest
+mode. No real borrowing transactions or payments exist in this
+project.
