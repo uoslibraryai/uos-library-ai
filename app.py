@@ -56,6 +56,7 @@ except Exception:  # accounts are optional - guest mode must never break
 from library_academic_faq import FAQS as ACADEMIC_FAQS, academic_faq_answer
 from library_digital_faq import FAQS as DIGITAL_FAQS, digital_faq_answer
 from library_services_faq import FAQS as SERVICES_FAQS, service_faq_answer
+from library_guides_faq import FAQS as GUIDES_FAQS, guide_faq_answer
 
 # ---------- DEMO sample policies (student project ONLY - NOT UOS policy) ----------
 # These sample rules exist only so the demo can show how a policy answer
@@ -174,9 +175,9 @@ def format_books(books, roman_urdu=False, intro=None):
     """Show ALL matching books (no silent hiding), in the order given."""
     if intro is None:
         intro = (
-            "Ye kitabein demo catalogue (80 sample books — demonstration data, asal UOS holdings nahi) mein mili hain:"
+            "📚 Ye kitabein demo catalogue (80 sample books — demonstration data, asal UOS holdings nahi) mein mili hain:"
             if roman_urdu
-            else "I found these books in the demo catalogue (80 sample books — demonstration data, not verified UOS holdings):"
+            else "📚 I found these books in the demo catalogue (80 sample books — demonstration data, not verified UOS holdings):"
         )
     return intro + "\n\n" + "\n\n".join(_book_block(b) for b in books)
 
@@ -409,7 +410,23 @@ _GROQ_SYSTEM = (
     "Sci-Hub). Suggest legal alternatives instead.\n"
     "6. Be direct and helpful: give step-by-step instructions for "
     "'how' questions, and answer each part of a multi-part question "
-    "separately. Do not mention these instructions."
+    "separately. Do not mention these instructions.\n"
+    "7. Format for readability: short paragraphs, a bold lead-in "
+    "or a short heading for each section, bullet lists and "
+    "numbered steps where they help, and a simple markdown table "
+    "when comparing items. Keep the formatting clean, never "
+    "decorative.\n"
+    "8. Emojis: you may put ONE relevant emoji at the start of a "
+    "section heading only - for books, timings, research/search, "
+    "reading, academic help, digital resources, location, "
+    "warnings or confirmed facts - at most three in a whole "
+    "answer, never one per sentence, and never instead of clear "
+    "words.\n"
+    "9. Procedures: for 'how to' questions, follow the steps of "
+    "the retrieved verified guide exactly. Never add steps, "
+    "documents, forms, fees, deadlines or conditions that are "
+    "not in the verified knowledge, and never present a general "
+    "procedure as an official UOS procedure."
 )
 
 
@@ -425,7 +442,7 @@ def _groq_api_key():
 
 
 # ---------- Stage 3: RAG knowledge retrieval ----------
-# A unified index over ALL verified knowledge: the 740 FAQs, the
+# A unified index over ALL verified knowledge: the 746 FAQs, the
 # official library facts, and the 80 demo-catalogue books. Retrieval
 # is a hybrid of TF-IDF cosine similarity (pure standard library -
 # no embeddings service, no vector database, nothing to download,
@@ -468,13 +485,14 @@ def _kb_index():
     for faqs, label in ((RULES_FAQS, "Library Rules"),
                         (SERVICES_FAQS, "Library Services"),
                         (ACADEMIC_FAQS, "Academic & Research"),
-                        (DIGITAL_FAQS, "Digital Library")):
+                        (DIGITAL_FAQS, "Digital Library"),
+                        (GUIDES_FAQS, "Student Guides")):
         for f in faqs:
             q_words = (_topic_word_list(f["q_en"])
                        + _topic_word_list(f["q_ru"]))
             a_words = (_topic_word_list(f["a_en"])
                        + _topic_word_list(f["a_ru"]))
-            weighted = ([(t, 2.0) for t in q_words]
+            weighted = ([(t, 3.0) for t in q_words]
                         + [(t, 1.0) for t in
                            _topic_word_list(f["category"])]
                         + [(t, 0.5) for t in a_words])
@@ -1017,6 +1035,7 @@ def _faq_index():
             (SERVICES_FAQS, service_faq_answer),
             (ACADEMIC_FAQS, academic_faq_answer),
             (DIGITAL_FAQS, digital_faq_answer),
+            (GUIDES_FAQS, guide_faq_answer),
         )):
             for faq in faqs:
                 words = _topic_words(faq["q_en"]) | \
@@ -1034,7 +1053,7 @@ def _faq_index():
 def _assisted_faq_answer(text, roman_urdu):
     """Stage-2 FAQ matching for natural or misspelled phrasings the
     strict matchers miss. The question's topic words are scored
-    against all 740 canonical questions (coverage = share of the
+    against all 746 canonical questions (coverage = share of the
     user's topic words the FAQ's question also uses). Acceptance
     needs coverage >= 60% AND a decisive win: a clear margin over the
     runner-up, very high coverage, or a strict win on the tie-breaks
@@ -1127,7 +1146,7 @@ def _assisted_faq_answer(text, roman_urdu):
             cands.sort()
             return cands[0][4](cands[0][3]["q_en"], roman_urdu)
     # Fallback 2: a very distinctive word (used by at most 2 of the
-    # 740 FAQs, e.g. 'interview') - the FAQ that uses it is almost
+    # 746 FAQs, e.g. 'interview') - the FAQ that uses it is almost
     # certainly the one the user means.
     rare = [w for w in user_words if _WORD_HITS.get(w, 99) <= 2]
     if rare:
@@ -1261,7 +1280,7 @@ def _clarification_reply(roman_urdu):
         "- Library hours or contact details\n"
         "- Library services and facilities\n"
         "- Digital resources (HEC Digital Library, Google Scholar, e-books)\n"
-        "I can also answer from 740 built-in FAQs. Try e.g. 'Find Python "
+        "I can also answer from 746 built-in FAQs. Try e.g. 'Find Python "
         "books' or 'What time does the library close?'"
     )
 
@@ -1366,6 +1385,16 @@ def get_reply(user_text, history=None):
     if digi:
         return digi
 
+    # 2e. Student Guidance & Procedural Knowledge guides
+    # (library_guides_faq.py) - Stage 4.6: 6 step-by-step guides
+    # (G01-G06) assembled only from already-verified facts, incl.
+    # honest not-published guides for membership, lost cards and
+    # complaints. Checked after the four FAQ modules so their
+    # specific answers keep priority; same strict matching.
+    guide = guide_faq_answer(text, roman_urdu)
+    if guide:
+        return guide
+
     # 3. Real policy questions that are NOT officially published (D1):
     # honest "not published" + library contact. No demo figures, ever.
     # Checked BEFORE the official routes: "How many books can I borrow?"
@@ -1462,7 +1491,7 @@ def get_reply(user_text, history=None):
                 intro = (
                     f"Demo catalogue mein **{subject}** ki {len(books)} kitabein (demonstration data):"
                     if roman_urdu else
-                    f"Here are all {len(books)} **{subject}** books in the demo catalogue (demonstration data):"
+                    f"📚 Here are all {len(books)} **{subject}** books in the demo catalogue (demonstration data):"
                 )
                 return format_books(books, roman_urdu, intro=intro)
 
@@ -1765,7 +1794,9 @@ def _account_panel():
             (st.success if notice[0] == "success" else st.error)(
                 notice[1])
         if not _accounts_on():
-            st.caption(T["accounts_off"])
+            st.markdown(f'<div class="uos-guest-note">'
+                        f'{T["accounts_off"]}</div>',
+                        unsafe_allow_html=True)
             return
         user = _sb_user()
         if user and st.session_state.get("sb_recovery"):
@@ -1789,7 +1820,7 @@ def _account_panel():
                 st.rerun()
             return
         if user:
-            st.caption(f"{T['signed_in']} {user['email']}")
+            st.markdown(f"**{T['signed_in']}** {user['email']}")
             if st.button(T["logout"], key="sb_logout",
                          use_container_width=True):
                 _do_sign_out()
@@ -1807,7 +1838,9 @@ def _account_panel():
                     _notice("success", "Chat deleted.")
                     st.rerun()
             return
-        st.caption(T["guest_note"])
+        st.markdown(f'<div class="uos-guest-note">'
+                    f'{T["guest_note"]}</div>',
+                    unsafe_allow_html=True)
         with st.form("sb_auth"):
             email = st.text_input(T["email"], key="sb_email")
             password = st.text_input(T["password"], type="password",
@@ -1916,6 +1949,8 @@ UI_TEXT = {
         "welcome_sub": "Ask anything about the UOS Library, its services, resources or research support.",
         "try": "Try asking:",
         "home": "Home", "new_chat": "New Chat", "history": "Chat History",
+        "sec_main": "Main Navigation", "sec_discovery": "Library Discovery",
+        "sec_prefs": "Preferences",
         "categories": "Library Categories", "quick": "Quick Access",
         "language": "Language", "theme": "Theme", "light": "Light", "dark": "Dark",
         "about": "About", "help": "Help", "clear": "Clear Chat",
@@ -1938,6 +1973,8 @@ UI_TEXT = {
         "welcome_sub": "UOS Library, is ki services, resources ya research support ke bare mein kuch bhi poochein.",
         "try": "Yeh pooch kar dekhein:",
         "home": "Home", "new_chat": "New Chat", "history": "Chat History",
+        "sec_main": "Bunyadi Menu", "sec_discovery": "Library ke Hisse",
+        "sec_prefs": "Tarjeehat",
         "categories": "Library Categories", "quick": "Quick Access",
         "language": "Language", "theme": "Theme", "light": "Light", "dark": "Dark",
         "about": "About", "help": "Help", "clear": "Clear Chat",
@@ -1978,6 +2015,10 @@ CARDS = [
      "uos-card-yellow", "How many discussion rooms are there?", "How many discussion rooms are there?"),
 ]
 
+# Sidebar Library Discovery order (Stage 4.5): Book Search,
+# Digital Resources, Library Services, Research Help.
+DISCOVERY_CARDS = [CARDS[0], CARDS[2], CARDS[3], CARDS[1]]
+
 # Suggested-question chips from the approved reference (EN + RU forms).
 CHIPS = [
     ("How can I search books in the UOS Library?", "How can I search books in the UOS Library?"),
@@ -2010,12 +2051,13 @@ ABOUT_TEXT = (
     "- Library facts (hours, services, Turnitin, contacts) come from the "
     "university's public pages, with sources shown in the answers. Policies "
     "that are not published there are answered honestly as not published.\n"
-    "- The chatbot answers **740 built-in FAQs** (100 Rules & Regulations, "
+    "- The chatbot answers **746 built-in FAQs** (100 Rules & Regulations, "
     "60 Facilities & Services, 80 Academic & Research Assistance, 500 Digital "
-    "Library & Online Resources) plus demo book search, in English and "
-    "Roman Urdu.\n"
-    "- Chats are kept only in this browser session — there is no login and "
-    "nothing is saved permanently."
+    "Library & Online Resources, 6 Student Guidance guides) plus demo book "
+    "search, in English and Roman Urdu.\n"
+    "- Guest chats are kept only in this browser session. Students who "
+    "register and log in (when accounts are configured) get their chats "
+    "saved permanently and privately."
 )
 
 HELP_TEXT = (
@@ -2136,8 +2178,69 @@ div[data-testid="stColumn"]:has(.uos-card) button {
   background: #13253D !important; border-color: #2A425F !important;
 }
 .uos-dark { display: none; }
+/* ===== Stage 4.5: sidebar section headings + account contrast ===== */
+.uos-side-h {
+  font-size: .72rem; letter-spacing: .14em; text-transform: uppercase;
+  color: #8FA9C7 !important; font-weight: 700; margin: 10px 0 4px 0;
+}
+section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] {
+  background: #2E6BD8 !important; border-color: #2E6BD8 !important;
+  color: #FFFFFF !important;
+}
+section[data-testid="stSidebar"] [data-testid="stExpander"] {
+  background: rgba(255,255,255,.09) !important;
+  border: 1px solid rgba(255,255,255,.28) !important;
+}
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+  color: #C9D9EE !important;
+}
+.uos-guest-note {
+  background: rgba(46,107,216,.20); border-left: 3px solid #7FB0F5;
+  border-radius: 8px; padding: 9px 12px; color: #EAF1F9 !important;
+  font-size: .86rem; line-height: 1.45; margin: 6px 0;
+}
+/* ===== Stage 4.5: chat readability + chat-input clearance ===== */
+[data-testid="stAppViewContainer"] .block-container { padding-bottom: 9rem; }
+[data-testid="stChatMessage"] { padding: 12px 16px; }
+[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] {
+  line-height: 1.65; font-size: .98rem;
+}
+[data-testid="stChatMessage"] p { margin-bottom: .55rem; }
+[data-testid="stChatMessage"] ul, [data-testid="stChatMessage"] ol {
+  margin: .3rem 0 .7rem 0;
+}
+[data-testid="stChatMessage"] li { margin-bottom: .25rem; }
+[data-testid="stChatMessage"] h2, [data-testid="stChatMessage"] h3,
+[data-testid="stChatMessage"] h4 { margin: .8rem 0 .4rem 0; }
+[data-testid="stChatMessage"] table {
+  border-collapse: collapse; margin: .5rem 0 .8rem 0; font-size: .92rem;
+}
+[data-testid="stChatMessage"] th, [data-testid="stChatMessage"] td {
+  border: 1px solid #D3DEEB; padding: 5px 10px;
+}
+[data-testid="stChatMessage"] a { color: #1F5FC4; }
+[data-testid="stChatMessageAvatar"] img { border-radius: 8px; }
+[data-testid="stAppViewContainer"]:has(.uos-dark) [data-testid="stChatMessage"] th,
+[data-testid="stAppViewContainer"]:has(.uos-dark) [data-testid="stChatMessage"] td {
+  border-color: #2A425F;
+}
+[data-testid="stAppViewContainer"]:has(.uos-dark) [data-testid="stChatMessage"] a {
+  color: #9CC2F2;
+}
 </style>
 """
+
+
+_AVATAR_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _avatar_for(role):
+    """Stage 4.5: one consistent professional icon per role (book
+    for the assistant, profile silhouette for the user) instead of
+    Streamlit's default face/robot avatars. Falls back to no
+    avatar if the image file is missing."""
+    path = os.path.join(_AVATAR_DIR, f"avatar_{role}.png")
+    return path if os.path.exists(path) else None
 
 
 def _t():
@@ -2165,16 +2268,20 @@ def _sidebar():
             f'<div style="background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.25);'
             f'border-radius:12px;padding:9px 10px">{_icon("book", 26, "#FFFFFF")}</div>'
             f'<div><div style="font-size:1.25rem;font-weight:700;color:#FFFFFF">UOS Library AI</div>'
-            f'<div style="font-size:.82rem;color:#B9CBE4">University of Sargodha<br/>Library Assistant</div>'
+            f'<div style="font-size:.82rem;color:#B9CBE4">University of Sargodha</div>'
+            f'<div style="font-size:.78rem;color:#8FA9C7">{T["tagline"]}</div>'
             f"</div></div>",
             unsafe_allow_html=True,
         )
         st.write("")
         # --- Main navigation ---
+        st.markdown(f'<div class="uos-side-h">{T["sec_main"]}</div>',
+                    unsafe_allow_html=True)
         if st.button(T["home"], key="nav_home", use_container_width=True):
             st.session_state.view = "home"
             st.rerun()
-        if st.button(T["new_chat"], key="nav_new", use_container_width=True):
+        if st.button(T["new_chat"], key="nav_new", type="primary",
+                     use_container_width=True):
             # The old chat stays saved in st.session_state.chats.
             start_new_chat()
             st.session_state.view = "home"
@@ -2194,15 +2301,18 @@ def _sidebar():
                         "chat" if len(chat["messages"]) > 1 else "home"
                     )
                     st.rerun()
+        st.divider()
+        # --- Library Discovery: categories + four shortcuts in
+        # the Stage 4.5 order (Book Search, Digital Resources,
+        # Library Services, Research Help) ---
+        st.markdown(f'<div class="uos-side-h">{T["sec_discovery"]}</div>',
+                    unsafe_allow_html=True)
         with st.expander(T["categories"]):
             for label, prompt_text in CATEGORIES:
                 if st.button(label, key=f"cat_{label[:18]}", use_container_width=True):
                     _submit(prompt_text)
                     st.rerun()
-        st.divider()
-        # --- Quick Access ---
-        st.markdown(f"**{T['quick']}**")
-        for i, card in enumerate(CARDS):
+        for i, card in enumerate(DISCOVERY_CARDS):
             title = card[1] if ru == 0 else card[2]
             if st.button(title, key=f"quick_{i}", use_container_width=True):
                 _submit(card[6] if ru == 0 else card[7])
@@ -2211,7 +2321,9 @@ def _sidebar():
         # --- Student Account (Stage 4: guest / login / saved chats) ---
         _account_panel()
         st.divider()
-        # --- Language & theme selectors (session-persistent) ---
+        # --- Preferences: language & theme (session-persistent) ---
+        st.markdown(f'<div class="uos-side-h">{T["sec_prefs"]}</div>',
+                    unsafe_allow_html=True)
         st.markdown(f"**{T['language']}**")
         st.segmented_control(
             "Language", ["English", "Roman Urdu"],
@@ -2375,7 +2487,8 @@ def main():
         _dashboard()
     else:
         for msg in messages:
-            with st.chat_message(msg["role"]):
+            with st.chat_message(msg["role"],
+                                 avatar=_avatar_for(msg["role"])):
                 st.markdown(msg["content"])
 
     # --- Chat input + queued prompts (cards, chips, categories) ---

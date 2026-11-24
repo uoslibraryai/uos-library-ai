@@ -192,6 +192,8 @@ Business 13, Engineering 13, English 12.
 
 ## Files
 - `app.py` — Streamlit UI + chat logic (routing, demo-policy safeguards)
+- `avatar_assistant.png` / `avatar_user.png` — the two chat avatar
+  icons (book / profile) used by the interface (Stage 4.5)
 - `library_info.py` — verified official library facts, sources and caveats
 - `library_faq.py` — 100 Rules & Regulations FAQs (Code of Conduct, Book
   Price Payment form, Information Services) with strict phrase matching
@@ -216,6 +218,17 @@ Business 13, Engineering 13, English 12.
   research visualization & data tools, subject-specific digital
   resources) with the same strict matching; checked after the
   academic FAQs
+- `library_guides_faq.py` — 6 Student Guidance guides (Stage 4.6,
+  G01–G06: membership, lost ID/library card, complaints & feedback,
+  finding a book on the shelves, Research Support Lab help, book
+  not available) with the same strict matching; checked after the
+  digital FAQs. Twelve existing answers (borrowing, returning,
+  reserving, renewing, clearance, discussion rooms, lost book,
+  printing/photocopying, Turnitin, e-books portal search, HEC
+  Digital Library) were also expanded into full step-by-step
+  guides in the same stage — every step uses only facts already
+  verified in the project's official sources, and unpublished
+  procedures are stated as not published with the library contact
 
 ## Digital Library & Online Resources FAQs (COMPLETE: 500 FAQs)
 
@@ -235,7 +248,7 @@ Dissertation Databases (20), Systematic Reviews & Meta-analysis
 (20), Research Collaboration & Academic Profiles (20), Research
 Visualization & Data Tools (20), and Subject-Specific Digital
 Resources (20). Together with the other FAQ modules the chatbot
-answers **740 built-in FAQs**.
+answers **746 built-in FAQs**.
 Every FAQ has an English and a Roman Urdu question and answer, a
 source URL, and a source status (Official UOS information / Official
 HEC information / Official external resource documentation / General
